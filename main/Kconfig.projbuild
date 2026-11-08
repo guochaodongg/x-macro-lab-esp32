@@ -33,6 +33,21 @@ config CUSTOM_ASSETS_FILE
         The custom assets file to flash.
         It can be a local file relative to the project directory or a remote url.
 
+config USE_DYNAMIC_BALL_EMOJI_COLLECTION
+    bool "Replace emojis with animated gradient-orb avatars"
+    depends on !USE_EMOTE_MESSAGE_STYLE
+    default y
+    help
+        Replace the board's default static emoji collection with the
+        project-owned dynamic_ball_128 GIF pack in main/assets/emoji/. Each
+        emotion is a looping 128x128 animated orb (about 228 KiB of flash and
+        80 KiB of RAM while playing). Animated GIF packs such as otto-gif are
+        kept, and Emote/EAF boards are unaffected. Only affects builds that
+        flash default assets. Disable to restore the original pack.
+        Regenerate with scripts/generate_dynamic_ball_emoji.py; use --size 64
+        on small screens, since a 128x128 orb can be clipped on 128x128 panels
+        using the WeChat message style.
+
 choice
     prompt "Default Language"
     default LANGUAGE_EN_US

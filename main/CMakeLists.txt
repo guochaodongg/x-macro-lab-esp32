@@ -962,6 +962,14 @@ elseif(CONFIG_BOARD_TYPE_LC_S3_WIFI_1_54TFT)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
 endif()
 
+# Optional global emoji pack override, applied after the board-specific chain.
+# Keep the animated GIF pack (Otto robot) as-is.
+if(CONFIG_USE_DYNAMIC_BALL_EMOJI_COLLECTION)
+    if(NOT DEFAULT_EMOJI_COLLECTION STREQUAL "otto-gif")
+        set(DEFAULT_EMOJI_COLLECTION dynamic_ball_128)
+    endif()
+endif()
+
 if(NOT BOARD_DIR AND NOT CMAKE_BUILD_EARLY_EXPANSION)
     message(FATAL_ERROR "The selected board does not define BOARD_DIR")
 endif()
@@ -1414,6 +1422,7 @@ function(build_default_assets_bin)
         list(APPEND BUILD_ARGS "--emoji_collection" "${DEFAULT_EMOJI_COLLECTION}")
         file(GLOB DEFAULT_EMOJI_FILES CONFIGURE_DEPENDS
             "${NOTO_FONTS_PATH}/png/${DEFAULT_EMOJI_COLLECTION}/*"
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/emoji/${DEFAULT_EMOJI_COLLECTION}/*"
         )
         list(APPEND DEFAULT_ASSETS_DEPENDENCIES ${DEFAULT_EMOJI_FILES})
     endif()

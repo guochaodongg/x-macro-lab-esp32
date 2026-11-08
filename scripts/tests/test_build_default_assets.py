@@ -41,6 +41,37 @@ class BuildDefaultAssetsTest(unittest.TestCase):
                     directory, None, "font_noto_sans_common_20_4.bin", None
                 )
 
+    def test_project_owned_dynamic_ball_collection_is_packaged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            collection = BUILD.get_emoji_collection_path(
+                "dynamic_ball_128", directory, str(ROOT)
+            )
+            self.assertEqual(
+                Path(collection),
+                ROOT / "main" / "assets" / "emoji" / "dynamic_ball_128",
+            )
+            entries = BUILD.process_emoji_collection(collection, directory)
+            names = {entry["name"] for entry in entries}
+            self.assertEqual({entry["file"] for entry in entries},
+                             {name + ".gif" for name in names})
+            self.assertLessEqual(
+                {"neutral", "happy", "sad", "sleepy", "robot_2", "idle"}, names
+            )
+            gif = (Path(collection) / "neutral.gif").read_bytes()
+            self.assertEqual(gif[:6], b"GIF89a")
+            self.assertEqual(struct.unpack("<HH", gif[6:10]), (128, 128))
+            self.assertIn(b"NETSCAPE2.0", gif[:128])
+            self.assertEqual(gif.count(b"\x21\xF9\x04"), 6)
+
+    def test_vendor_emoji_collection_lookup_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            vendor_png = Path(directory) / "png" / "noto-color-emoji_64"
+            vendor_png.mkdir(parents=True)
+            self.assertEqual(
+                BUILD.get_emoji_collection_path("noto-color-emoji_64", directory),
+                str(vendor_png),
+            )
+
     def test_max_size_rejects_oversized_assets(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
