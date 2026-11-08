@@ -1029,6 +1029,21 @@ void Application::HandleStateChangedEvent() {
     auto led = board.GetLed();
     led->OnStateChanged();
 
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+    // Boot, Wi-Fi setup and activation messages stay on the original chat
+    // screen. Show the launcher once the device first becomes idle, and always
+    // return to the chat screen when voice activity starts (including wake
+    // words detected while the camera page is open).
+    if (new_state == kDeviceStateIdle) {
+        if (home_page_pending_) {
+            home_page_pending_ = false;
+            display->SetHomePageView(HomePageView::kHome);
+        }
+    } else {
+        display->SetHomePageView(HomePageView::kAiChat);
+    }
+#endif
+
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:

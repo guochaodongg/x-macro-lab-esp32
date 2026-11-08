@@ -155,6 +155,9 @@ private:
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+    bool home_page_pending_ = true;  // Show the launcher on the first idle state
+#endif
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 

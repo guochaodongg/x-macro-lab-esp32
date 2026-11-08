@@ -55,6 +55,27 @@
         "FOUND_NEW_ASSETS": "Found new assets: %s",
         "DOWNLOAD_ASSETS_FAILED": "Failed to download assets",
         "LOADING_ASSETS": "Loading assets...",
-        "HELLO_MY_FRIEND": "Hello, my friend!"
+        "HELLO_MY_FRIEND": "Hello, my friend!",
+        "HOME_TITLE": "Home",
+        "HOME_HINT": "Choose a function",
+        "HOME_CAMERA": "Camera",
+        "HOME_AI_CHAT": "AI Chat",
+        "HOME_BUTTON": "Home",
+        "CAMERA_CAPTURE": "Capture",
+        "CAMERA_RESUME": "Resume",
+        "CAMERA_BACK": "Back",
+        "CAMERA_PREVIEW_HINT": "Live preview",
+        "CAMERA_CAPTURED": "Photo captured",
+        "CAMERA_NO_CAMERA": "Camera not available",
+        "CAMERA_GALLERY": "Gallery",
+        "GALLERY_PREV": "Prev",
+        "GALLERY_NEXT": "Next",
+        "GALLERY_LOADING": "Loading...",
+        "GALLERY_EMPTY": "No photos on SD card",
+        "GALLERY_LOAD_FAILED": "Cannot read photo",
+        "PHOTO_SAVING": "Saving...",
+        "PHOTO_SAVED": "Photo saved to SD card",
+        "PHOTO_SAVE_FAILED": "Save failed, check SD card",
+        "SD_CARD_UNAVAILABLE": "SD card not available"
     }
 }

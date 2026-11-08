@@ -55,6 +55,27 @@
         "HELLO_MY_FRIEND": "你好，我的朋友！",
         "CONNECTION_SUCCESSFUL": "连接成功",
         "FLIGHT_MODE_OFF": "飞行模式已关闭",
-        "FLIGHT_MODE_ON": "飞行模式已开启"
+        "FLIGHT_MODE_ON": "飞行模式已开启",
+        "HOME_TITLE": "主页面",
+        "HOME_HINT": "请选择功能",
+        "HOME_CAMERA": "相机",
+        "HOME_AI_CHAT": "AI 对话",
+        "HOME_BUTTON": "主页",
+        "CAMERA_CAPTURE": "拍照",
+        "CAMERA_RESUME": "继续",
+        "CAMERA_BACK": "返回",
+        "CAMERA_PREVIEW_HINT": "实时预览",
+        "CAMERA_CAPTURED": "已拍照",
+        "CAMERA_NO_CAMERA": "此设备没有相机",
+        "CAMERA_GALLERY": "相册",
+        "GALLERY_PREV": "上一张",
+        "GALLERY_NEXT": "下一张",
+        "GALLERY_LOADING": "正在加载...",
+        "GALLERY_EMPTY": "SD 卡中没有照片",
+        "GALLERY_LOAD_FAILED": "无法读取照片",
+        "PHOTO_SAVING": "正在保存...",
+        "PHOTO_SAVED": "照片已保存到 SD 卡",
+        "PHOTO_SAVE_FAILED": "保存失败，请检查 SD 卡",
+        "SD_CARD_UNAVAILABLE": "未检测到 SD 卡"
     }
 }

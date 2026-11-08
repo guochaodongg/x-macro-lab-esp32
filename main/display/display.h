@@ -23,6 +23,14 @@
 class LvglFont;
 class LvglImage;
 
+// Which page is shown on top of the existing chat screen.
+enum class HomePageView {
+    kAiChat,   // The original wake-word / chat screen
+    kHome,     // Launcher with the camera and AI chat entries
+    kCamera,   // Camera live preview page
+    kGallery,  // Photo gallery on the SD card
+};
+
 class Theme {
 public:
     Theme(const std::string& name) : name_(name) {}
@@ -60,6 +68,9 @@ public:
     virtual void ClearTextGlyphs() {}
     virtual void SetEmojiCollection(std::shared_ptr<EmojiCollection>) {}
     virtual void SetupUI() { setup_ui_called_ = true; }
+    // Switch between the launcher, the camera page and the original chat screen.
+    // Displays without a launcher keep the chat screen and ignore the request.
+    virtual void SetHomePageView(HomePageView view) { (void)view; }
     virtual bool IsMonochrome() const { return false; }
     virtual bool SupportsGuiOperations() const { return false; }
     virtual void SetHideSubtitle(bool hide) { (void)hide; }

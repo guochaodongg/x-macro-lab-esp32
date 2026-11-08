@@ -11,6 +11,10 @@
 
 #define PREVIEW_IMAGE_DURATION_MS 5000
 
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+class HomePage;
+#endif
+
 class LcdDisplay : public LvglDisplay {
 protected:
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
@@ -32,6 +36,9 @@ protected:
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+    std::unique_ptr<HomePage> home_page_;
+#endif
 
     void InitializeLcdThemes();
     virtual bool Lock(int timeout_ms = 0) override;
@@ -50,6 +57,9 @@ public:
     virtual void ClearChatMessages() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
     virtual void SetupUI() override;
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+    virtual void SetHomePageView(HomePageView view) override;
+#endif
     // Add theme switching function
     virtual void SetTheme(Theme* theme) override;
 

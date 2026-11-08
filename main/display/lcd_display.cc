@@ -14,9 +14,14 @@
 #include <src/misc/cache/lv_cache.h>
 #include <algorithm>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "board.h"
+
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+#include "home_page.h"
+#endif
 
 #define TAG "LcdDisplay"
 
@@ -322,6 +327,10 @@ MipiLcdDisplay::MipiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
 }
 
 LcdDisplay::~LcdDisplay() {
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+    // Stop the camera preview task before any LVGL object is destroyed.
+    home_page_.reset();
+#endif
     SetPreviewImage(nullptr);
 
     // Clean up GIF controller
@@ -383,6 +392,26 @@ LcdDisplay::~LcdDisplay() {
 bool LcdDisplay::Lock(int timeout_ms) { return lvgl_port_lock(timeout_ms); }
 
 void LcdDisplay::Unlock() { lvgl_port_unlock(); }
+
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+void LcdDisplay::SetHomePageView(HomePageView view) {
+    if (home_page_ != nullptr) {
+        // The preview task may be waiting for the LVGL lock inside Capture(),
+        // so join it before taking the lock here.
+        home_page_->StopWorker();
+    }
+
+    DisplayLockGuard lock(this);
+    if (home_page_ == nullptr) {
+        if (view == HomePageView::kAiChat || !setup_ui_called_) {
+            return;
+        }
+        home_page_ = std::make_unique<HomePage>(this, width_, height_,
+                                                static_cast<LvglTheme*>(current_theme_));
+    }
+    home_page_->SetView(view);
+}
+#endif
 
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
 void LcdDisplay::SetupUI() {
@@ -744,6 +773,14 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
 
 void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     DisplayLockGuard lock(this);
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+    if (home_page_ != nullptr && home_page_->IsOverlayVisible()) {
+        if (home_page_->IsCameraPageVisible()) {
+            home_page_->SetCameraFrame(std::move(image));
+        }
+        return;
+    }
+#endif
     if (content_ == nullptr) {
         return;
     }
@@ -1081,6 +1118,14 @@ void LcdDisplay::SetupUI() {
 
 void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     DisplayLockGuard lock(this);
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+    if (home_page_ != nullptr && home_page_->IsOverlayVisible()) {
+        if (home_page_->IsCameraPageVisible()) {
+            home_page_->SetCameraFrame(std::move(image));
+        }
+        return;
+    }
+#endif
     if (preview_image_ == nullptr) {
         ESP_LOGE(TAG, "Preview image is not initialized");
         return;
@@ -1279,6 +1324,12 @@ void LcdDisplay::SetTheme(Theme* theme) {
     DisplayLockGuard lock(this);
 
     auto lvgl_theme = static_cast<LvglTheme*>(theme);
+
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+    if (home_page_ != nullptr) {
+        home_page_->ApplyTheme(lvgl_theme);
+    }
+#endif
 
     // Get the active screen
     lv_obj_t* screen = lv_screen_active();

@@ -6,7 +6,8 @@
         {
             "name": "lichuang-dev",
             "sdkconfig_append": [
-                "CONFIG_USE_DEVICE_AEC=y"
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_XIAOZHI_ENABLE_SDCARD=y"
             ]
         }
     ]

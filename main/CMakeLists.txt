@@ -1024,6 +1024,12 @@ endif()
 if (CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING)
     list(APPEND SOURCES "boards/common/blufi.cpp")
 endif ()
+if(CONFIG_XIAOZHI_ENABLE_HOME_PAGE)
+    list(APPEND SOURCES "display/home_page.cc")
+endif()
+if(CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY)
+    list(APPEND SOURCES "photo_storage.cc")
+endif()
 # Select language directory according to Kconfig
 if(CONFIG_LANGUAGE_ZH_CN)
     set(LANG_DIR "zh-CN")
@@ -1199,6 +1205,14 @@ if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD)
         esp_driver_sdmmc
         sdmmc
     )
+endif()
+if(CONFIG_XIAOZHI_ENABLE_SDCARD)
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA sdmmc)
+    if(CONFIG_XIAOZHI_SDCARD_MODE_SDMMC_1BIT)
+        list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_driver_sdmmc)
+    else()
+        list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_driver_sdspi)
+    endif()
 endif()
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}

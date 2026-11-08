@@ -979,6 +979,120 @@ choice DISPLAY_STYLE
             || BOARD_TYPE_ESP_SENSAIRSHUTTLE || BOARD_TYPE_STACKCHAN
 endchoice
 
+config XIAOZHI_ENABLE_HOME_PAGE
+    bool "Enable home page with Camera and AI Chat entries"
+    depends on !USE_EMOTE_MESSAGE_STYLE
+    default y
+    help
+        Show a launcher with two entries when the device first becomes idle:
+        a camera page with a local live preview and capture, and the original
+        wake-word AI chat screen. Voice activity automatically returns to the
+        chat screen, and a small floating button brings the launcher back.
+        Boards without a camera keep the entry but report that no camera is
+        available. No-display, OLED and emote boards are unaffected.
+
+config XIAOZHI_ENABLE_PHOTO_GALLERY
+    bool "Save camera photos to SD card and browse them in a gallery"
+    depends on XIAOZHI_ENABLE_HOME_PAGE && !IDF_TARGET_ESP32
+    default y
+    help
+        Add a gallery to the camera page. Capture encodes the current preview
+        frame to JPEG and writes it to the SD card, and the gallery reads the
+        saved JPEGs back. An SD card must be mounted at the configured mount
+        point, either by the board or by the generic mount option below. The
+        original ESP32 is excluded because its JPEG helpers are not built.
+
+config XIAOZHI_PHOTO_STORAGE_DIR
+    string "Directory for saved photos"
+    depends on XIAOZHI_ENABLE_PHOTO_GALLERY
+    default "/sdcard/DCIM/XiaoZhi"
+    help
+        VFS path where IMG_xxxxxxxx.JPG files are created. It must be located
+        under the SD card mount point.
+
+config XIAOZHI_ENABLE_SDCARD
+    bool "Mount the on-board SD/TF card for photos"
+    depends on XIAOZHI_ENABLE_PHOTO_GALLERY
+    default n
+    help
+        Enable only if the board does not already mount /sdcard itself (for
+        example ESP32-P4-Function-EV-Board and XingZhi ABS 2.0 do). Select the
+        interface and GPIOs below according to the board schematic.
+
+choice XIAOZHI_SDCARD_MODE
+    prompt "SD card interface"
+    depends on XIAOZHI_ENABLE_SDCARD
+    default XIAOZHI_SDCARD_MODE_SDMMC_1BIT
+
+config XIAOZHI_SDCARD_MODE_SDMMC_1BIT
+    bool "SDMMC 1-bit (CLK / CMD / DAT0)"
+    depends on IDF_TARGET_ESP32S3 || IDF_TARGET_ESP32P4
+    help
+        For TF sockets that only wire CLK, CMD and DAT0. DAT3/CD is pulled high
+        but not connected to the ESP32, so SPI mode (which needs it as CS) is
+        not possible. Example: LiChuang ShiZhanPai ESP32-S3.
+
+config XIAOZHI_SDCARD_MODE_SDSPI
+    bool "SPI (CLK / MOSI / MISO / CS)"
+    help
+        For boards or SD modules that wire DAT3 to a GPIO used as chip select.
+endchoice
+
+config XIAOZHI_SDCARD_MOUNT_POINT
+    string "SD card mount point"
+    depends on XIAOZHI_ENABLE_SDCARD
+    default "/sdcard"
+
+config XIAOZHI_SDMMC_CLK_GPIO
+    int "SDMMC CLK GPIO (-1 leaves the card unmounted)"
+    depends on XIAOZHI_ENABLE_SDCARD && XIAOZHI_SDCARD_MODE_SDMMC_1BIT
+    default 47 if BOARD_TYPE_LICHUANG_DEV_S3
+    default -1
+    help
+        LiChuang ShiZhanPai ESP32-S3 schematic net: IO47_SD_CLK.
+
+config XIAOZHI_SDMMC_CMD_GPIO
+    int "SDMMC CMD GPIO"
+    depends on XIAOZHI_ENABLE_SDCARD && XIAOZHI_SDCARD_MODE_SDMMC_1BIT
+    default 48 if BOARD_TYPE_LICHUANG_DEV_S3
+    default -1
+    help
+        LiChuang ShiZhanPai ESP32-S3 schematic net: IO48_SD_CMD.
+
+config XIAOZHI_SDMMC_D0_GPIO
+    int "SDMMC DAT0 GPIO"
+    depends on XIAOZHI_ENABLE_SDCARD && XIAOZHI_SDCARD_MODE_SDMMC_1BIT
+    default 21 if BOARD_TYPE_LICHUANG_DEV_S3
+    default -1
+    help
+        LiChuang ShiZhanPai ESP32-S3 schematic net: IO21_SD_DAT0.
+
+config XIAOZHI_SDCARD_SPI_HOST
+    int "SPI host number for the SD card (2 = SPI2_HOST, 3 = SPI3_HOST)"
+    depends on XIAOZHI_ENABLE_SDCARD && XIAOZHI_SDCARD_MODE_SDSPI
+    default 2
+    range 2 3
+
+config XIAOZHI_SDCARD_PIN_CLK
+    int "SPI SD card CLK GPIO"
+    depends on XIAOZHI_ENABLE_SDCARD && XIAOZHI_SDCARD_MODE_SDSPI
+    default -1
+
+config XIAOZHI_SDCARD_PIN_MOSI
+    int "SPI SD card MOSI GPIO"
+    depends on XIAOZHI_ENABLE_SDCARD && XIAOZHI_SDCARD_MODE_SDSPI
+    default -1
+
+config XIAOZHI_SDCARD_PIN_MISO
+    int "SPI SD card MISO GPIO"
+    depends on XIAOZHI_ENABLE_SDCARD && XIAOZHI_SDCARD_MODE_SDSPI
+    default -1
+
+config XIAOZHI_SDCARD_PIN_CS
+    int "SPI SD card CS GPIO"
+    depends on XIAOZHI_ENABLE_SDCARD && XIAOZHI_SDCARD_MODE_SDSPI
+    default -1
+
 config JC4827W543_EXTERNAL_AMP
     bool "JC4827W543: external I2S amplifier instead of the on-board NS4168"
     depends on BOARD_TYPE_GUITION_JC4827W543
