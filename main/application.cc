@@ -803,6 +803,14 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
 void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
 void Application::HandleToggleChatEvent() {
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+    // On the camera page the chat / wake button acts as the shutter instead of
+    // starting a conversation.
+    auto display = Board::GetInstance().GetDisplay();
+    if (display != nullptr && display->HandleCameraPageButton()) {
+        return;
+    }
+#endif
     auto state = GetDeviceState();
 
     if (state == kDeviceStateNotifying) {
@@ -867,6 +875,14 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 }
 
 void Application::HandleStartListeningEvent() {
+#if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
+    // Press-to-talk boards use press down/up instead of a click; keep the
+    // shutter behaviour on the camera page for that variant too.
+    auto display = Board::GetInstance().GetDisplay();
+    if (display != nullptr && display->HandleCameraPageButton()) {
+        return;
+    }
+#endif
     auto state = GetDeviceState();
 
     if (state == kDeviceStateNotifying) {

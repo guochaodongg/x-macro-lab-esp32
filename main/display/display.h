@@ -71,6 +71,10 @@ public:
     // Switch between the launcher, the camera page and the original chat screen.
     // Displays without a launcher keep the chat screen and ignore the request.
     virtual void SetHomePageView(HomePageView view) { (void)view; }
+    // Shortcut-button hook for launcher pages. Returns true when the camera
+    // page consumed the button as a shutter / resume action, so the caller
+    // must not start an AI conversation.
+    virtual bool HandleCameraPageButton() { return false; }
     virtual bool IsMonochrome() const { return false; }
     virtual bool SupportsGuiOperations() const { return false; }
     virtual void SetHideSubtitle(bool hide) { (void)hide; }

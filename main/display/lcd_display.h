@@ -59,6 +59,7 @@ public:
     virtual void SetupUI() override;
 #if CONFIG_XIAOZHI_ENABLE_HOME_PAGE
     virtual void SetHomePageView(HomePageView view) override;
+    virtual bool HandleCameraPageButton() override;
 #endif
     // Add theme switching function
     virtual void SetTheme(Theme* theme) override;

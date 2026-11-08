@@ -8,6 +8,8 @@
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_timer.h>
+#include <material_symbols.h>
 
 #include <algorithm>
 #include <chrono>
@@ -24,7 +26,12 @@
 #define TAG "HomePage"
 
 namespace {
-constexpr int kWorkerIntervalMs = 300;
+// Aim for ~15 fps. Esp32Camera::Capture() blocks on the sensor and the LVGL
+// lock, so the actual frame rate is paced by those instead of by this timer.
+constexpr int kPreviewIntervalMs = 66;
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+constexpr int64_t kDeleteConfirmUs = 3000000;
+#endif
 
 void SetObjectVisible(lv_obj_t* obj, bool visible) {
     if (obj == nullptr) {
@@ -37,17 +44,23 @@ void SetObjectVisible(lv_obj_t* obj, bool visible) {
     }
 }
 
-lv_obj_t* CreateRoot(lv_obj_t* screen, int width, int height, int padding) {
+lv_obj_t* CreateRoot(lv_obj_t* screen, int width, int height, int padding, bool flex = true) {
     auto* root = lv_obj_create(screen);
     lv_obj_set_size(root, width, height);
     lv_obj_set_pos(root, 0, 0);
     lv_obj_set_style_radius(root, 0, 0);
     lv_obj_set_style_border_width(root, 0, 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_all(root, padding, 0);
-    lv_obj_set_style_pad_row(root, padding, 0);
-    lv_obj_set_flex_flow(root, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(root, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    if (flex) {
+        lv_obj_set_style_pad_all(root, padding, 0);
+        lv_obj_set_style_pad_row(root, padding, 0);
+        lv_obj_set_flex_flow(root, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(root, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+    } else {
+        lv_obj_set_style_pad_all(root, 0, 0);
+        lv_obj_set_style_pad_row(root, 0, 0);
+    }
     lv_obj_set_scrollbar_mode(root, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_flag(root, LV_OBJ_FLAG_CLICKABLE);
     return root;
@@ -105,8 +118,12 @@ std::shared_ptr<CapturedFrame> CopyRgb565Frame(const lv_img_dsc_t* dsc) {
     if (data == nullptr) {
         return nullptr;
     }
-    for (size_t y = 0; y < height; ++y) {
-        memcpy(data + y * width * 2, dsc->data + y * stride, width * 2);
+    if (stride == width * 2) {
+        memcpy(data, dsc->data, size);
+    } else {
+        for (size_t y = 0; y < height; ++y) {
+            memcpy(data + y * width * 2, dsc->data + y * stride, width * 2);
+        }
     }
     auto frame = std::make_shared<CapturedFrame>();
     frame->data = data;
@@ -170,17 +187,19 @@ lv_obj_t* HomePage::CreateButton(lv_obj_t* parent, const char* text, int width, 
     return button;
 }
 
-lv_obj_t* HomePage::CreateButtonRow(lv_obj_t* parent, int width, int height) {
-    auto* row = lv_obj_create(parent);
-    lv_obj_set_size(row, width, height);
-    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
-    lv_obj_set_style_pad_all(row, 0, 0);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_AROUND, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
-    return row;
+lv_obj_t* HomePage::CreateIconButton(lv_obj_t* parent, const char* icon, int size) {
+    auto* button = lv_obj_create(parent);
+    lv_obj_set_size(button, size, size);
+    lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_radius(button, size / 2, 0);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
+    lv_obj_set_scrollbar_mode(button, LV_SCROLLBAR_MODE_OFF);
+    auto* label = lv_label_create(button);
+    lv_label_set_text(label, icon);
+    lv_obj_center(label);
+    icon_labels_.push_back(label);
+    return button;
 }
 
 void HomePage::CreateUi(LvglTheme* theme) {
@@ -191,9 +210,18 @@ void HomePage::CreateUi(LvglTheme* theme) {
     const int padding = std::max(2, std::min(8, height_ / 30));
     const int button_height = std::max(line_height + 12, height_ * 20 / 100);
     const int entry_width = width_ * 80 / 100;
-    const int action_width = width_ * 28 / 100;
-    preview_width_ = width_ * 80 / 100;
-    preview_height_ = height_ * 32 / 100;
+
+    // Camera and gallery use a nearly full-screen preview with small floating
+    // icon buttons instead of a stack of wide text buttons.
+    const int margin = std::max(2, std::min(8, height_ / 40));
+    const int icon_size = std::max(line_height + 8, std::min(36, height_ * 15 / 100));
+    const int shutter_size = std::min(icon_size * 3 / 2, height_ / 4);
+    // A full-screen box matches the QVGA camera frame exactly, so LVGL can blit
+    // it directly instead of resampling ~70K pixels on every frame.
+    preview_width_ = width_;
+    preview_height_ = height_;
+    const int icon_vertical_offset = std::max(0, (shutter_size - icon_size) / 2);
+    const int info_vertical_offset = std::max(0, (shutter_size - line_height) / 2);
 
     home_root_ = CreateRoot(screen, width_, height_, padding);
     auto* home_title = lv_label_create(home_root_);
@@ -205,55 +233,59 @@ void HomePage::CreateUi(LvglTheme* theme) {
         CreateButton(home_root_, Lang::Strings::HOME_CAMERA, entry_width, button_height);
     ai_button_ = CreateButton(home_root_, Lang::Strings::HOME_AI_CHAT, entry_width, button_height);
 
-    camera_root_ = CreateRoot(screen, width_, height_, padding);
-    auto* camera_title = lv_label_create(camera_root_);
-    lv_label_set_text(camera_title, Lang::Strings::HOME_CAMERA);
+    camera_root_ = CreateRoot(screen, width_, height_, 0, false);
     auto camera_box = CreateImageBox(camera_root_, preview_width_, preview_height_);
     preview_box_ = camera_box.box;
     camera_image_ = camera_box.image;
+    lv_obj_set_pos(preview_box_, 0, 0);
     camera_hint_ = lv_label_create(camera_root_);
     lv_label_set_text(camera_hint_, Lang::Strings::CAMERA_PREVIEW_HINT);
+    lv_obj_set_width(camera_hint_, preview_width_);
     lv_obj_set_style_text_align(camera_hint_, LV_TEXT_ALIGN_CENTER, 0);
-    auto* camera_row =
-        CreateButtonRow(camera_root_, width_ * 90 / 100, button_height + 2 * padding);
+    lv_obj_set_style_bg_opa(camera_hint_, LV_OPA_70, 0);
+    lv_obj_set_style_pad_all(camera_hint_, 2, 0);
+    lv_obj_set_style_radius(camera_hint_, 4, 0);
+    lv_obj_align(camera_hint_, LV_ALIGN_BOTTOM_MID, 0, -(shutter_size + 2 * margin + 4));
+    back_button_ = CreateIconButton(camera_root_, MATERIAL_SYMBOLS_ARROW_BACK, icon_size);
+    lv_obj_align(back_button_, LV_ALIGN_TOP_LEFT, margin + 2, margin + 2);
+    gallery_button_ = CreateIconButton(camera_root_, MATERIAL_SYMBOLS_IMAGE, icon_size);
+    lv_obj_align(gallery_button_, LV_ALIGN_BOTTOM_LEFT, margin + 4,
+                 -(margin + icon_vertical_offset));
     capture_button_ =
-        CreateButton(camera_row, Lang::Strings::CAMERA_CAPTURE, action_width, button_height);
+        CreateIconButton(camera_root_, MATERIAL_SYMBOLS_PHOTO_CAMERA, shutter_size);
+    lv_obj_align(capture_button_, LV_ALIGN_BOTTOM_MID, 0, -margin);
     capture_label_ = lv_obj_get_child(capture_button_, 0);
-    gallery_button_ =
-        CreateButton(camera_row, Lang::Strings::CAMERA_GALLERY, action_width, button_height);
-    back_button_ =
-        CreateButton(camera_row, Lang::Strings::CAMERA_BACK, action_width, button_height);
 
-    gallery_root_ = CreateRoot(screen, width_, height_, padding);
-    auto* gallery_title = lv_label_create(gallery_root_);
-    lv_label_set_text(gallery_title, Lang::Strings::CAMERA_GALLERY);
+    gallery_root_ = CreateRoot(screen, width_, height_, 0, false);
     auto gallery_box = CreateImageBox(gallery_root_, preview_width_, preview_height_);
     gallery_box_ = gallery_box.box;
     gallery_image_ = gallery_box.image;
+    lv_obj_set_pos(gallery_box_, 0, 0);
     gallery_info_ = lv_label_create(gallery_root_);
     lv_label_set_text(gallery_info_, Lang::Strings::GALLERY_LOADING);
+    lv_obj_set_width(gallery_info_, preview_width_);
     lv_obj_set_style_text_align(gallery_info_, LV_TEXT_ALIGN_CENTER, 0);
-    auto* gallery_row =
-        CreateButtonRow(gallery_root_, width_ * 90 / 100, button_height + 2 * padding);
-    gallery_prev_button_ =
-        CreateButton(gallery_row, Lang::Strings::GALLERY_PREV, action_width, button_height);
-    gallery_next_button_ =
-        CreateButton(gallery_row, Lang::Strings::GALLERY_NEXT, action_width, button_height);
+    lv_obj_set_style_bg_opa(gallery_info_, LV_OPA_70, 0);
+    lv_obj_set_style_pad_all(gallery_info_, 2, 0);
+    lv_obj_set_style_radius(gallery_info_, 4, 0);
+    lv_obj_align(gallery_info_, LV_ALIGN_BOTTOM_MID, 0, -(margin + info_vertical_offset));
     gallery_back_button_ =
-        CreateButton(gallery_row, Lang::Strings::CAMERA_BACK, action_width, button_height);
+        CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_ARROW_BACK, icon_size);
+    lv_obj_align(gallery_back_button_, LV_ALIGN_TOP_LEFT, margin + 2, margin + 2);
+    gallery_prev_button_ =
+        CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_KEYBOARD_ARROW_LEFT, icon_size);
+    lv_obj_align(gallery_prev_button_, LV_ALIGN_LEFT_MID, margin + 2, 0);
+    gallery_next_button_ =
+        CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_KEYBOARD_ARROW_RIGHT, icon_size);
+    lv_obj_align(gallery_next_button_, LV_ALIGN_RIGHT_MID, -(margin + 2), 0);
+    gallery_delete_button_ =
+        CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_DELETE, icon_size);
+    lv_obj_align(gallery_delete_button_, LV_ALIGN_TOP_RIGHT, -(margin + 2), margin + 2);
+    gallery_delete_label_ = lv_obj_get_child(gallery_delete_button_, 0);
 
     // Small floating entry back to the launcher, only visible on the chat screen.
-    home_button_ = lv_obj_create(screen);
-    lv_obj_set_size(home_button_, std::min(std::max(line_height * 3, width_ / 5), width_ / 2),
-                    std::min(line_height + 12, height_ / 3));
-    lv_obj_align(home_button_, LV_ALIGN_LEFT_MID, 0, 0);
-    lv_obj_add_flag(home_button_, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_radius(home_button_, 8, 0);
-    lv_obj_set_style_border_width(home_button_, 1, 0);
-    lv_obj_set_style_bg_opa(home_button_, LV_OPA_COVER, 0);
-    auto* home_button_label = lv_label_create(home_button_);
-    lv_label_set_text(home_button_label, Lang::Strings::HOME_BUTTON);
-    lv_obj_center(home_button_label);
+    home_button_ = CreateIconButton(screen, MATERIAL_SYMBOLS_HOME, icon_size);
+    lv_obj_align(home_button_, LV_ALIGN_LEFT_MID, margin, 0);
 
     lv_obj_add_event_cb(
         camera_button_,
@@ -305,6 +337,7 @@ void HomePage::CreateUi(LvglTheme* theme) {
             if (total == 0) {
                 return;
             }
+            page->CancelDelete();
             page->gallery_index_ = (page->gallery_index_ + total - 1) % total;
             page->RequestGalleryPhoto();
         },
@@ -317,33 +350,21 @@ void HomePage::CreateUi(LvglTheme* theme) {
             if (total == 0) {
                 return;
             }
+            page->CancelDelete();
             page->gallery_index_ = (page->gallery_index_ + 1) % total;
             page->RequestGalleryPhoto();
         },
         LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
+        gallery_delete_button_,
+        [](lv_event_t* e) {
+            static_cast<HomePage*>(lv_event_get_user_data(e))->RequestDeletePhoto();
+        },
+        LV_EVENT_CLICKED, this);
+    lv_obj_add_event_cb(
         capture_button_,
         [](lv_event_t* e) {
-            auto* page = static_cast<HomePage*>(lv_event_get_user_data(e));
-#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
-            if (!page->preview_paused_.load()) {
-                // The next preview frame is encoded and written to the SD card,
-                // then the preview freezes to show the captured photo.
-                page->save_requested_.store(true);
-                page->SetCameraHint(Lang::Strings::PHOTO_SAVING);
-                return;
-            }
-            page->preview_paused_.store(false);
-            lv_label_set_text(page->capture_label_, Lang::Strings::CAMERA_CAPTURE);
-            page->SetCameraHint(Lang::Strings::CAMERA_PREVIEW_HINT);
-#else
-            const bool was_paused = page->preview_paused_.load();
-            page->preview_paused_.store(!was_paused);
-            lv_label_set_text(page->capture_label_, was_paused ? Lang::Strings::CAMERA_CAPTURE
-                                                              : Lang::Strings::CAMERA_RESUME);
-            page->SetCameraHint(was_paused ? Lang::Strings::CAMERA_PREVIEW_HINT
-                                           : Lang::Strings::CAMERA_CAPTURED);
-#endif
+            static_cast<HomePage*>(lv_event_get_user_data(e))->CapturePhoto();
         },
         LV_EVENT_CLICKED, this);
 
@@ -354,6 +375,7 @@ void HomePage::CreateUi(LvglTheme* theme) {
     SetObjectVisible(home_button_, false);
 #if !CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
     SetObjectVisible(gallery_button_, false);
+    SetObjectVisible(gallery_delete_button_, false);
 #endif
     ApplyTheme(theme);
 }
@@ -376,13 +398,26 @@ void HomePage::ApplyTheme(LvglTheme* theme) {
     }
     for (auto* button : {camera_button_, ai_button_, capture_button_, gallery_button_,
                          back_button_, gallery_prev_button_, gallery_next_button_,
-                         gallery_back_button_, home_button_}) {
+                         gallery_back_button_, gallery_delete_button_, home_button_}) {
         if (button == nullptr) {
             continue;
         }
         lv_obj_set_style_bg_color(button, theme->chat_background_color(), 0);
         lv_obj_set_style_border_color(button, theme->border_color(), 0);
         lv_obj_set_style_text_color(button, theme->text_color(), 0);
+    }
+    for (auto* label : {camera_hint_, gallery_info_}) {
+        if (label == nullptr) {
+            continue;
+        }
+        lv_obj_set_style_bg_color(label, theme->background_color(), 0);
+        lv_obj_set_style_text_color(label, theme->text_color(), 0);
+    }
+    if (theme->icon_font() != nullptr && theme->icon_font()->font() != nullptr) {
+        auto* icon_font = theme->icon_font()->font();
+        for (auto* label : icon_labels_) {
+            lv_obj_set_style_text_font(label, icon_font, 0);
+        }
     }
 }
 
@@ -398,6 +433,45 @@ void HomePage::RequestView(HomePageView view, bool wake_ai) {
     });
 }
 
+void HomePage::RequestCapture() {
+    // The shortcut-button callback runs outside the LVGL task. Route the
+    // shutter action through the main task and take the display lock there.
+    Application::GetInstance().Schedule([this]() {
+        DisplayLockGuard lock(display_);
+        if (view_.load() != HomePageView::kCamera) {
+            return;
+        }
+        CapturePhoto();
+    });
+}
+
+void HomePage::SetCaptureIcon(const char* icon) {
+    if (capture_label_ != nullptr) {
+        lv_label_set_text(capture_label_, icon);
+    }
+}
+
+void HomePage::CapturePhoto() {
+    // Called with the display lock held (LVGL event callback or main task).
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    if (!preview_paused_.load()) {
+        // The next preview frame is encoded and written to the SD card,
+        // then the preview freezes to show the captured photo.
+        save_requested_.store(true);
+        SetCameraHint(Lang::Strings::PHOTO_SAVING);
+        return;
+    }
+    preview_paused_.store(false);
+    SetCaptureIcon(MATERIAL_SYMBOLS_PHOTO_CAMERA);
+    SetCameraHint(Lang::Strings::CAMERA_PREVIEW_HINT);
+#else
+    const bool was_paused = preview_paused_.load();
+    preview_paused_.store(!was_paused);
+    SetCaptureIcon(was_paused ? MATERIAL_SYMBOLS_PHOTO_CAMERA : MATERIAL_SYMBOLS_REFRESH);
+    SetCameraHint(was_paused ? Lang::Strings::CAMERA_PREVIEW_HINT : Lang::Strings::CAMERA_CAPTURED);
+#endif
+}
+
 bool HomePage::IsCameraPageVisible() const {
     return view_.load() == HomePageView::kCamera;
 }
@@ -409,6 +483,7 @@ bool HomePage::IsOverlayVisible() const {
 
 void HomePage::SetView(HomePageView view) {
     view_.store(view);
+    CancelDelete();
     SetObjectVisible(home_root_, view == HomePageView::kHome);
     SetObjectVisible(camera_root_, view == HomePageView::kCamera);
     SetObjectVisible(gallery_root_, view == HomePageView::kGallery);
@@ -496,7 +571,7 @@ void HomePage::SetCameraFrame(std::unique_ptr<LvglImage> image) {
             });
         }
         preview_paused_.store(true);
-        lv_label_set_text(capture_label_, Lang::Strings::CAMERA_RESUME);
+        SetCaptureIcon(MATERIAL_SYMBOLS_REFRESH);
         SetCameraHint(Lang::Strings::PHOTO_SAVING);
     }
 #endif
@@ -511,7 +586,7 @@ void HomePage::PrepareCameraPage() {
     }
     SetObjectVisible(capture_button_, true);
     SetCameraHint(Lang::Strings::CAMERA_PREVIEW_HINT);
-    lv_label_set_text(capture_label_, Lang::Strings::CAMERA_CAPTURE);
+    SetCaptureIcon(MATERIAL_SYMBOLS_PHOTO_CAMERA);
 }
 
 void HomePage::ShowGalleryImage(std::shared_ptr<LvglImage> image) {
@@ -586,8 +661,68 @@ void HomePage::RequestGalleryPhoto() {
 #endif
 }
 
+void HomePage::CancelDelete() {
+    if (!delete_pending_) {
+        return;
+    }
+    delete_pending_ = false;
+    if (gallery_delete_label_ != nullptr) {
+        lv_label_set_text(gallery_delete_label_, MATERIAL_SYMBOLS_DELETE);
+    }
+}
+
+void HomePage::RequestDeletePhoto() {
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    if (gallery_paths_.empty()) {
+        return;
+    }
+    // Two taps inside the confirmation window are required: deleting a photo
+    // is irreversible and the button is a small touch target.
+    const int64_t now = esp_timer_get_time();
+    if (!delete_pending_ || now > delete_deadline_us_) {
+        delete_pending_ = true;
+        delete_deadline_us_ = now + kDeleteConfirmUs;
+        lv_label_set_text(gallery_delete_label_, MATERIAL_SYMBOLS_CHECK);
+        SetGalleryInfo(Lang::Strings::GALLERY_DELETE_CONFIRM);
+        return;
+    }
+    CancelDelete();
+    const std::string path = gallery_paths_[gallery_index_];
+    SetGalleryInfo(Lang::Strings::GALLERY_DELETING);
+    PostTask([this, path]() {
+        const bool deleted = PhotoStorage::DeletePhoto(path);
+        Application::GetInstance().Schedule([this, path, deleted]() {
+            DisplayLockGuard lock(display_);
+            if (view_.load() != HomePageView::kGallery) {
+                return;
+            }
+            if (!deleted) {
+                SetGalleryInfo(Lang::Strings::GALLERY_DELETE_FAILED);
+                return;
+            }
+            auto it = std::find(gallery_paths_.begin(), gallery_paths_.end(), path);
+            if (it != gallery_paths_.end()) {
+                gallery_paths_.erase(it);
+            }
+            if (gallery_paths_.empty()) {
+                gallery_index_ = 0;
+                lv_image_set_src(gallery_image_, nullptr);
+                gallery_frame_.reset();
+                SetObjectVisible(gallery_image_, false);
+                SetGalleryInfo(Lang::Strings::GALLERY_EMPTY);
+                return;
+            }
+            if (gallery_index_ >= gallery_paths_.size()) {
+                gallery_index_ = gallery_paths_.size() - 1;
+            }
+            RequestGalleryPhoto();
+        });
+    });
+#endif
+}
+
 void HomePage::StartWorker() {
-    if (worker_thread_.joinable()) {
+    if (io_thread_.joinable()) {
         return;
     }
     {
@@ -595,38 +730,46 @@ void HomePage::StartWorker() {
         worker_tasks_.clear();
         worker_running_ = true;
     }
-    worker_thread_ = std::thread([this]() { WorkerLoop(); });
+    preview_running_.store(true);
+    io_thread_ = std::thread([this]() { IoLoop(); });
+    preview_thread_ = std::thread([this]() { PreviewLoop(); });
 }
 
-void HomePage::WorkerLoop() {
-    auto* camera = Board::GetInstance().GetCamera();
+void HomePage::IoLoop() {
     while (true) {
         std::function<void()> task;
-        bool capture = false;
         {
             std::unique_lock<std::mutex> lock(worker_mutex_);
-            worker_cv_.wait_for(lock, std::chrono::milliseconds(kWorkerIntervalMs), [this] {
-                return !worker_running_ || !worker_tasks_.empty();
-            });
+            worker_cv_.wait(lock,
+                            [this] { return !worker_running_ || !worker_tasks_.empty(); });
             if (!worker_running_) {
                 break;
             }
-            if (!worker_tasks_.empty()) {
-                task = std::move(worker_tasks_.front());
-                worker_tasks_.pop_front();
-            } else {
-                capture = view_.load() == HomePageView::kCamera && !preview_paused_.load();
-            }
+            task = std::move(worker_tasks_.front());
+            worker_tasks_.pop_front();
         }
-        if (task) {
-            task();  // JPEG encoding / SD card IO, never holds the LVGL lock.
-            continue;
-        }
-        if (capture && camera != nullptr) {
+        task();  // JPEG encoding / SD card IO, never holds the LVGL lock.
+    }
+}
+
+void HomePage::PreviewLoop() {
+    // Continuous captures must not preempt the LVGL or audio tasks.
+    TaskPriorityReset lower_priority(1);
+    auto* camera = Board::GetInstance().GetCamera();
+    auto next_frame = std::chrono::steady_clock::now();
+    while (preview_running_.load()) {
+        if (view_.load() == HomePageView::kCamera && !preview_paused_.load() &&
+            camera != nullptr) {
             // Capture() forwards the frame to Display::SetPreviewImage(), which
             // routes it to the camera page while the camera page is visible.
             camera->Capture();
         }
+        next_frame += std::chrono::milliseconds(kPreviewIntervalMs);
+        const auto now = std::chrono::steady_clock::now();
+        if (next_frame < now) {
+            next_frame = now;  // Never try to catch up on missed frames.
+        }
+        std::this_thread::sleep_until(next_frame);
     }
 }
 
@@ -639,14 +782,17 @@ void HomePage::PostTask(std::function<void()> task) {
 }
 
 void HomePage::StopWorker() {
-    if (!worker_thread_.joinable()) {
-        return;
+    preview_running_.store(false);
+    if (io_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(worker_mutex_);
+            worker_running_ = false;
+            worker_tasks_.clear();
+        }
+        worker_cv_.notify_all();
+        io_thread_.join();
     }
-    {
-        std::lock_guard<std::mutex> lock(worker_mutex_);
-        worker_running_ = false;
-        worker_tasks_.clear();
+    if (preview_thread_.joinable()) {
+        preview_thread_.join();
     }
-    worker_cv_.notify_all();
-    worker_thread_.join();
 }

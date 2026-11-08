@@ -25,6 +25,10 @@ public:
     // Photo paths, newest first.
     static std::vector<std::string> ListPhotos();
 
+    // Removes a single photo inside the photo directory. Paths outside the
+    // directory or with a non-JPEG suffix are rejected.
+    static bool DeletePhoto(const std::string& path);
+
     // Reads a photo and decodes it to an RGB565 image scaled to fit. The
     // shared_ptr keeps the callback copyable for Application::Schedule().
     static std::shared_ptr<LvglImage> LoadPhoto(const std::string& path, int max_width,

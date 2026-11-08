@@ -260,6 +260,30 @@ std::vector<std::string> PhotoStorage::ListPhotos() {
     return paths;
 }
 
+bool PhotoStorage::DeletePhoto(const std::string& path) {
+    const std::string dir = PhotoDir() + "/";
+    if (path.compare(0, dir.size(), dir) != 0 ||
+        path.find('/', dir.size()) != std::string::npos) {
+        ESP_LOGE(TAG, "Refusing to delete %s", path.c_str());
+        return false;
+    }
+    const std::string name = path.substr(dir.size());
+    if (name.size() <= 4) {
+        return false;
+    }
+    const size_t suffix = name.size() - 4;
+    if (name.compare(suffix, 4, ".JPG") != 0 && name.compare(suffix, 4, ".jpg") != 0) {
+        ESP_LOGE(TAG, "Refusing to delete non-photo %s", path.c_str());
+        return false;
+    }
+    if (remove(path.c_str()) != 0 && errno != ENOENT) {
+        ESP_LOGE(TAG, "Failed to delete %s: %s", path.c_str(), strerror(errno));
+        return false;
+    }
+    ESP_LOGI(TAG, "Deleted %s", path.c_str());
+    return true;
+}
+
 std::shared_ptr<LvglImage> PhotoStorage::LoadPhoto(const std::string& path, int max_width,
                                                    int max_height) {
     FILE* file = fopen(path.c_str(), "rb");

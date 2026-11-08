@@ -411,6 +411,15 @@ void LcdDisplay::SetHomePageView(HomePageView view) {
     }
     home_page_->SetView(view);
 }
+
+bool LcdDisplay::HandleCameraPageButton() {
+    DisplayLockGuard lock(this);
+    if (home_page_ == nullptr || !home_page_->IsCameraPageVisible()) {
+        return false;
+    }
+    home_page_->RequestCapture();
+    return true;
+}
 #endif
 
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
