@@ -18,10 +18,12 @@
 #include <vector>
 
 class LvglImage;
+class VideoRecorder;
 
 // Launcher drawn on top of the existing chat screen. It has two entries: a
-// camera page with a local live preview / photo capture, and the original
-// wake-word / AI chat screen. The camera page also hosts an SD card gallery.
+// camera page with a local live preview / photo / video capture, and the
+// original wake-word / AI chat screen. The camera page also hosts an SD card
+// gallery.
 // LVGL object access must happen with the display lock held, except for
 // StopWorker(), which joins the background task and must run without it.
 class HomePage {
@@ -62,15 +64,24 @@ private:
     void StartWorker();
     void IoLoop();
     void PreviewLoop();
+    void PlaybackLoop();
     void PostTask(std::function<void()> task);
     void PrepareCameraPage();
     void SetCameraHint(const char* text);
     void SetGalleryInfo(const char* text);
     void LoadGallery();
-    void RequestGalleryPhoto();
+    void RequestGalleryMedia();
     void ShowGalleryImage(std::shared_ptr<LvglImage> image);
+    void TogglePlayback();
+    void StartPlayback(const std::string& path);
+    void StopPlayback();
+    void SetPlayIcon(const char* icon);
     void RequestDeletePhoto();
     void CancelDelete();
+    void ToggleRecording();
+    void StartRecording();
+    void StopRecording();
+    void SetVideoIcon(const char* icon);
 
     Display* display_;
     std::vector<lv_obj_t*> icon_labels_;
@@ -92,6 +103,9 @@ private:
     lv_obj_t* capture_label_ = nullptr;
     lv_obj_t* gallery_button_ = nullptr;
     lv_obj_t* back_button_ = nullptr;
+    lv_obj_t* video_button_ = nullptr;
+    lv_obj_t* video_label_ = nullptr;
+    lv_timer_t* hint_timer_ = nullptr;
 
     lv_obj_t* gallery_root_ = nullptr;
     lv_obj_t* gallery_box_ = nullptr;
@@ -102,6 +116,8 @@ private:
     lv_obj_t* gallery_back_button_ = nullptr;
     lv_obj_t* gallery_delete_button_ = nullptr;
     lv_obj_t* gallery_delete_label_ = nullptr;
+    lv_obj_t* video_play_button_ = nullptr;
+    lv_obj_t* video_play_label_ = nullptr;
 
     std::atomic<HomePageView> view_{HomePageView::kAiChat};
     std::unique_ptr<LvglImage> camera_frame_;
@@ -110,6 +126,24 @@ private:
     size_t gallery_index_ = 0;
     bool delete_pending_ = false;
     int64_t delete_deadline_us_ = 0;
+
+    // Video frames are queued as IO tasks with a bounded backlog. recorder_
+    // and video_start_failed_ are touched only by the IO task (FIFO order).
+    std::shared_ptr<VideoRecorder> recorder_;
+    bool video_start_failed_ = false;
+    std::atomic<bool> recording_{false};
+    std::atomic<int> pending_video_frames_{0};
+    int64_t video_deadline_us_ = 0;
+    int64_t next_video_frame_us_ = 0;
+
+    // Playback decodes AVI frames on its own low-priority task. The path and
+    // paused flag are shared with the UI thread under playback_mutex_.
+    std::thread playback_thread_;
+    std::atomic<bool> playback_running_{false};
+    std::atomic<int> pending_playback_frames_{0};
+    std::mutex playback_mutex_;
+    std::string playback_path_;
+    bool playback_paused_ = false;
 
     // Preview and IO run on separate tasks, so JPEG encoding / SD card writes
     // can never stall the camera preview loop.

@@ -82,8 +82,11 @@ bool Esp32Camera::Capture() {
         return false;
     }
 
-    // Get the latest frame, discard old frames for real-time performance
-    for (int i = 0; i < 2; i++) {
+    // For AI stills, discard a stale frame first. A live preview needs the
+    // lowest possible latency, so it takes the first available frame instead
+    // of waiting for the sensor to produce one more.
+    const int frames_to_grab = realtime_preview_ ? 1 : 2;
+    for (int i = 0; i < frames_to_grab; i++) {
         if (current_fb_) {
             esp_camera_fb_return(current_fb_);
         }
@@ -145,7 +148,9 @@ bool Esp32Camera::Capture() {
                  current_fb_->len);
     }
 
-    ESP_LOGI(TAG, "Captured frame: %dx%d, len=%zu, format=%d", current_fb_->width,
+    // Debug level: printing this on every preview frame stalls the UART and
+    // adds a visible jitter to the live view.
+    ESP_LOGD(TAG, "Captured frame: %dx%d, len=%zu, format=%d", current_fb_->width,
              current_fb_->height, current_fb_->len, current_fb_->format);
 
     return true;
@@ -173,6 +178,8 @@ bool Esp32Camera::SetSwapBytes(bool enabled) {
     swap_bytes_enabled_ = enabled;
     return true;
 }
+
+void Esp32Camera::SetRealtimePreview(bool enabled) { realtime_preview_ = enabled; }
 
 std::expected<std::string, std::string> Esp32Camera::Explain(const std::string& question) {
     if (explain_url_.empty()) {

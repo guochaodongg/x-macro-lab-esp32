@@ -26,11 +26,19 @@
 #define TAG "HomePage"
 
 namespace {
-// Aim for ~15 fps. Esp32Camera::Capture() blocks on the sensor and the LVGL
-// lock, so the actual frame rate is paced by those instead of by this timer.
-constexpr int kPreviewIntervalMs = 66;
+// Capture() itself blocks on the sensor and the LVGL lock, so this is only a
+// ceiling on how often the preview task wakes up, not a fixed frame interval.
+// Recording gives the JPEG encoder / SD writer more room by previewing slower.
+constexpr int kPreviewIntervalMs = 25;
+constexpr int kRecordingPreviewIntervalMs = 80;
+constexpr int kHintVisibleMs = 5000;
 #if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
 constexpr int64_t kDeleteConfirmUs = 3000000;
+constexpr int kVideoFps = 10;
+constexpr int64_t kVideoFrameIntervalUs = 1000000 / kVideoFps;
+constexpr int64_t kMaxVideoDurationUs = 30 * 1000000;
+constexpr int kMaxQueuedVideoFrames = 3;
+constexpr int kMaxQueuedPlaybackFrames = 2;
 #endif
 
 void SetObjectVisible(lv_obj_t* obj, bool visible) {
@@ -43,6 +51,16 @@ void SetObjectVisible(lv_obj_t* obj, bool visible) {
         lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
     }
 }
+
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+bool IsVideoPath(const std::string& path) {
+    if (path.size() <= 4) {
+        return false;
+    }
+    const std::string suffix = path.substr(path.size() - 4);
+    return suffix == ".AVI" || suffix == ".avi";
+}
+#endif
 
 lv_obj_t* CreateRoot(lv_obj_t* screen, int width, int height, int padding, bool flex = true) {
     auto* root = lv_obj_create(screen);
@@ -143,6 +161,10 @@ HomePage::HomePage(Display* display, int width, int height, LvglTheme* theme)
 HomePage::~HomePage() {
     // Make any already queued UI callbacks no-ops before the LVGL objects go.
     view_.store(HomePageView::kAiChat);
+    if (hint_timer_ != nullptr) {
+        lv_timer_delete(hint_timer_);
+        hint_timer_ = nullptr;
+    }
     StopWorker();
     if (home_button_ != nullptr) {
         lv_obj_del(home_button_);
@@ -255,6 +277,10 @@ void HomePage::CreateUi(LvglTheme* theme) {
         CreateIconButton(camera_root_, MATERIAL_SYMBOLS_PHOTO_CAMERA, shutter_size);
     lv_obj_align(capture_button_, LV_ALIGN_BOTTOM_MID, 0, -margin);
     capture_label_ = lv_obj_get_child(capture_button_, 0);
+    video_button_ = CreateIconButton(camera_root_, MATERIAL_SYMBOLS_PLAY_ARROW, icon_size);
+    lv_obj_align(video_button_, LV_ALIGN_BOTTOM_RIGHT, -(margin + 4),
+                 -(margin + icon_vertical_offset));
+    video_label_ = lv_obj_get_child(video_button_, 0);
 
     gallery_root_ = CreateRoot(screen, width_, height_, 0, false);
     auto gallery_box = CreateImageBox(gallery_root_, preview_width_, preview_height_);
@@ -282,6 +308,10 @@ void HomePage::CreateUi(LvglTheme* theme) {
         CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_DELETE, icon_size);
     lv_obj_align(gallery_delete_button_, LV_ALIGN_TOP_RIGHT, -(margin + 2), margin + 2);
     gallery_delete_label_ = lv_obj_get_child(gallery_delete_button_, 0);
+    video_play_button_ = CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_PAUSE, icon_size);
+    lv_obj_align(video_play_button_, LV_ALIGN_TOP_RIGHT,
+                 -(margin + 2 + icon_size + 4), margin + 2);
+    video_play_label_ = lv_obj_get_child(video_play_button_, 0);
 
     // Small floating entry back to the launcher, only visible on the chat screen.
     home_button_ = CreateIconButton(screen, MATERIAL_SYMBOLS_HOME, icon_size);
@@ -339,7 +369,7 @@ void HomePage::CreateUi(LvglTheme* theme) {
             }
             page->CancelDelete();
             page->gallery_index_ = (page->gallery_index_ + total - 1) % total;
-            page->RequestGalleryPhoto();
+            page->RequestGalleryMedia();
         },
         LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
@@ -352,7 +382,7 @@ void HomePage::CreateUi(LvglTheme* theme) {
             }
             page->CancelDelete();
             page->gallery_index_ = (page->gallery_index_ + 1) % total;
-            page->RequestGalleryPhoto();
+            page->RequestGalleryMedia();
         },
         LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
@@ -362,20 +392,46 @@ void HomePage::CreateUi(LvglTheme* theme) {
         },
         LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
+        video_play_button_,
+        [](lv_event_t* e) {
+            static_cast<HomePage*>(lv_event_get_user_data(e))->TogglePlayback();
+        },
+        LV_EVENT_CLICKED, this);
+    lv_obj_add_event_cb(
         capture_button_,
         [](lv_event_t* e) {
             static_cast<HomePage*>(lv_event_get_user_data(e))->CapturePhoto();
         },
         LV_EVENT_CLICKED, this);
+    lv_obj_add_event_cb(
+        video_button_,
+        [](lv_event_t* e) {
+            static_cast<HomePage*>(lv_event_get_user_data(e))->ToggleRecording();
+        },
+        LV_EVENT_CLICKED, this);
+
+    // Every hint is transient: it appears on entering the camera page (and on
+    // each status change) and disappears again after kHintVisibleMs.
+    hint_timer_ = lv_timer_create(
+        [](lv_timer_t* timer) {
+            auto* page = static_cast<HomePage*>(lv_timer_get_user_data(timer));
+            SetObjectVisible(page->camera_hint_, false);
+            lv_timer_pause(timer);
+        },
+        kHintVisibleMs, this);
+    lv_timer_pause(hint_timer_);
 
     // Created after SetupUI(), so these roots are already above the chat UI.
     SetObjectVisible(home_root_, false);
     SetObjectVisible(camera_root_, false);
     SetObjectVisible(gallery_root_, false);
     SetObjectVisible(home_button_, false);
+    SetObjectVisible(camera_hint_, false);
+    SetObjectVisible(video_play_button_, false);
 #if !CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
     SetObjectVisible(gallery_button_, false);
     SetObjectVisible(gallery_delete_button_, false);
+    SetObjectVisible(video_button_, false);
 #endif
     ApplyTheme(theme);
 }
@@ -397,8 +453,9 @@ void HomePage::ApplyTheme(LvglTheme* theme) {
         }
     }
     for (auto* button : {camera_button_, ai_button_, capture_button_, gallery_button_,
-                         back_button_, gallery_prev_button_, gallery_next_button_,
-                         gallery_back_button_, gallery_delete_button_, home_button_}) {
+                         back_button_, video_button_, gallery_prev_button_,
+                         gallery_next_button_, gallery_back_button_, gallery_delete_button_,
+                         video_play_button_, home_button_}) {
         if (button == nullptr) {
             continue;
         }
@@ -453,8 +510,20 @@ void HomePage::SetCaptureIcon(const char* icon) {
 
 void HomePage::CapturePhoto() {
     // Called with the display lock held (LVGL event callback or main task).
+    const bool taking_photo = !preview_paused_.load();
+    if (taking_photo) {
 #if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
-    if (!preview_paused_.load()) {
+        // A still freezes the preview, which would starve the video stream.
+        StopRecording();
+#endif
+        // PlaySound() wakes the audio pipeline; route it through the main task
+        // so it never runs while the LVGL lock is held.
+        Application::GetInstance().Schedule([]() {
+            Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
+        });
+    }
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    if (taking_photo) {
         // The next preview frame is encoded and written to the SD card,
         // then the preview freezes to show the captured photo.
         save_requested_.store(true);
@@ -484,6 +553,16 @@ bool HomePage::IsOverlayVisible() const {
 void HomePage::SetView(HomePageView view) {
     view_.store(view);
     CancelDelete();
+    StopPlayback();
+    auto* camera = Board::GetInstance().GetCamera();
+    if (camera != nullptr) {
+        camera->SetRealtimePreview(view == HomePageView::kCamera);
+    }
+    SetVideoIcon(MATERIAL_SYMBOLS_PLAY_ARROW);
+    if (hint_timer_ != nullptr) {
+        lv_timer_pause(hint_timer_);
+    }
+    SetObjectVisible(camera_hint_, false);
     SetObjectVisible(home_root_, view == HomePageView::kHome);
     SetObjectVisible(camera_root_, view == HomePageView::kCamera);
     SetObjectVisible(gallery_root_, view == HomePageView::kGallery);
@@ -509,8 +588,14 @@ void HomePage::SetView(HomePageView view) {
 }
 
 void HomePage::SetCameraHint(const char* text) {
-    if (camera_hint_ != nullptr) {
-        lv_label_set_text(camera_hint_, text);
+    if (camera_hint_ == nullptr) {
+        return;
+    }
+    lv_label_set_text(camera_hint_, text);
+    SetObjectVisible(camera_hint_, true);
+    if (hint_timer_ != nullptr) {
+        lv_timer_reset(hint_timer_);
+        lv_timer_resume(hint_timer_);
     }
 }
 
@@ -537,6 +622,31 @@ void HomePage::SetCameraFrame(std::unique_ptr<LvglImage> image) {
     SetObjectVisible(camera_image_, true);
 
 #if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    if (recording_.load() && !preview_paused_.load()) {
+        const int64_t now = esp_timer_get_time();
+        if (now >= video_deadline_us_) {
+            StopRecording();
+        } else if (now >= next_video_frame_us_ &&
+                   pending_video_frames_.load() < kMaxQueuedVideoFrames) {
+            next_video_frame_us_ = now + kVideoFrameIntervalUs;
+            auto video_frame = CopyRgb565Frame(dsc);
+            if (video_frame != nullptr) {
+                pending_video_frames_.fetch_add(1);
+                PostTask([this, video_frame]() {
+                    if (recorder_ == nullptr && !video_start_failed_) {
+                        recorder_ = VideoRecorder::Start(video_frame->width,
+                                                         video_frame->height, kVideoFps);
+                        video_start_failed_ = recorder_ == nullptr;
+                    }
+                    if (recorder_ != nullptr) {
+                        recorder_->AddFrame(video_frame->data, video_frame->size,
+                                            video_frame->width, video_frame->height);
+                    }
+                    pending_video_frames_.fetch_sub(1);
+                });
+            }
+        }
+    }
     if (save_requested_.exchange(false)) {
         auto frame = CopyRgb565Frame(dsc);
         if (frame != nullptr) {
@@ -581,10 +691,15 @@ void HomePage::PrepareCameraPage() {
     if (Board::GetInstance().GetCamera() == nullptr) {
         SetCameraHint(Lang::Strings::CAMERA_NO_CAMERA);
         SetObjectVisible(capture_button_, false);
+        SetObjectVisible(video_button_, false);
         ESP_LOGW(TAG, "No camera on this board");
         return;
     }
     SetObjectVisible(capture_button_, true);
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    SetObjectVisible(video_button_, true);
+    SetVideoIcon(MATERIAL_SYMBOLS_PLAY_ARROW);
+#endif
     SetCameraHint(Lang::Strings::CAMERA_PREVIEW_HINT);
     SetCaptureIcon(MATERIAL_SYMBOLS_PHOTO_CAMERA);
 }
@@ -607,7 +722,7 @@ void HomePage::LoadGallery() {
     SetGalleryInfo(Lang::Strings::GALLERY_LOADING);
     PostTask([this]() {
         const bool available = PhotoStorage::IsAvailable();
-        auto paths = available ? PhotoStorage::ListPhotos() : std::vector<std::string>();
+        auto paths = available ? PhotoStorage::ListMedia() : std::vector<std::string>();
         Application::GetInstance().Schedule([this, paths, available]() {
             DisplayLockGuard lock(display_);
             if (view_.load() != HomePageView::kGallery) {
@@ -625,18 +740,36 @@ void HomePage::LoadGallery() {
                 SetObjectVisible(gallery_image_, false);
                 return;
             }
-            RequestGalleryPhoto();
+            RequestGalleryMedia();
         });
     });
 #endif
 }
 
-void HomePage::RequestGalleryPhoto() {
+void HomePage::RequestGalleryMedia() {
 #if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
     if (gallery_paths_.empty()) {
         return;
     }
     const std::string path = gallery_paths_[gallery_index_];
+    const char* slash = strrchr(path.c_str(), '/');
+    const char* name = slash == nullptr ? path.c_str() : slash + 1;
+    char info[128];
+    if (IsVideoPath(path)) {
+        StartPlayback(path);
+        SetObjectVisible(video_play_button_, true);
+        SetPlayIcon(MATERIAL_SYMBOLS_PAUSE);
+        // Drop the previous photo before the first video frame is decoded.
+        lv_image_set_src(gallery_image_, nullptr);
+        gallery_frame_.reset();
+        SetObjectVisible(gallery_image_, false);
+        snprintf(info, sizeof(info), "%s %u/%u %s", Lang::Strings::GALLERY_VIDEO,
+                 (unsigned)(gallery_index_ + 1), (unsigned)gallery_paths_.size(), name);
+        SetGalleryInfo(info);
+        return;
+    }
+    StopPlayback();
+    SetObjectVisible(video_play_button_, false);
     SetGalleryInfo(Lang::Strings::GALLERY_LOADING);
     PostTask([this, path]() {
         auto image = PhotoStorage::LoadPhoto(path, preview_width_, preview_height_);
@@ -676,8 +809,8 @@ void HomePage::RequestDeletePhoto() {
     if (gallery_paths_.empty()) {
         return;
     }
-    // Two taps inside the confirmation window are required: deleting a photo
-    // is irreversible and the button is a small touch target.
+    // Two taps inside the confirmation window are required: deleting media is
+    // irreversible and the button is a small touch target.
     const int64_t now = esp_timer_get_time();
     if (!delete_pending_ || now > delete_deadline_us_) {
         delete_pending_ = true;
@@ -687,10 +820,11 @@ void HomePage::RequestDeletePhoto() {
         return;
     }
     CancelDelete();
+    StopPlayback();  // Close the AVI before removing it from the SD card.
     const std::string path = gallery_paths_[gallery_index_];
     SetGalleryInfo(Lang::Strings::GALLERY_DELETING);
     PostTask([this, path]() {
-        const bool deleted = PhotoStorage::DeletePhoto(path);
+        const bool deleted = PhotoStorage::DeleteMedia(path);
         Application::GetInstance().Schedule([this, path, deleted]() {
             DisplayLockGuard lock(display_);
             if (view_.load() != HomePageView::kGallery) {
@@ -709,13 +843,177 @@ void HomePage::RequestDeletePhoto() {
                 lv_image_set_src(gallery_image_, nullptr);
                 gallery_frame_.reset();
                 SetObjectVisible(gallery_image_, false);
+                SetObjectVisible(video_play_button_, false);
                 SetGalleryInfo(Lang::Strings::GALLERY_EMPTY);
                 return;
             }
             if (gallery_index_ >= gallery_paths_.size()) {
                 gallery_index_ = gallery_paths_.size() - 1;
             }
-            RequestGalleryPhoto();
+            RequestGalleryMedia();
+        });
+    });
+#endif
+}
+
+void HomePage::SetPlayIcon(const char* icon) {
+    if (video_play_label_ != nullptr) {
+        lv_label_set_text(video_play_label_, icon);
+    }
+}
+
+void HomePage::StartPlayback(const std::string& path) {
+    std::lock_guard<std::mutex> lock(playback_mutex_);
+    playback_path_ = path;
+    playback_paused_ = false;
+}
+
+void HomePage::StopPlayback() {
+    {
+        std::lock_guard<std::mutex> lock(playback_mutex_);
+        playback_path_.clear();
+        playback_paused_ = false;
+    }
+    SetObjectVisible(video_play_button_, false);
+    SetPlayIcon(MATERIAL_SYMBOLS_PAUSE);
+}
+
+void HomePage::TogglePlayback() {
+    bool paused = false;
+    {
+        std::lock_guard<std::mutex> lock(playback_mutex_);
+        if (playback_path_.empty()) {
+            return;
+        }
+        playback_paused_ = !playback_paused_;
+        paused = playback_paused_;
+    }
+    SetPlayIcon(paused ? MATERIAL_SYMBOLS_PLAY_ARROW : MATERIAL_SYMBOLS_PAUSE);
+}
+
+void HomePage::PlaybackLoop() {
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    TaskPriorityReset lower_priority(1);
+    std::string current_path;
+    std::shared_ptr<VideoPlayer> player;
+    auto next_frame = std::chrono::steady_clock::now();
+    while (playback_running_.load()) {
+        std::string wanted;
+        bool paused = false;
+        {
+            std::lock_guard<std::mutex> lock(playback_mutex_);
+            wanted = playback_path_;
+            paused = playback_paused_;
+        }
+        if (wanted.empty()) {
+            player.reset();
+            current_path.clear();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            next_frame = std::chrono::steady_clock::now();
+            continue;
+        }
+        if (wanted != current_path) {
+            player = VideoPlayer::Open(wanted);
+            current_path = wanted;
+            next_frame = std::chrono::steady_clock::now();
+            if (player == nullptr) {
+                Application::GetInstance().Schedule([this, wanted]() {
+                    DisplayLockGuard lock(display_);
+                    if (view_.load() != HomePageView::kGallery ||
+                        gallery_paths_.empty() ||
+                        gallery_paths_[gallery_index_] != wanted) {
+                        return;
+                    }
+                    SetGalleryInfo(Lang::Strings::GALLERY_VIDEO_FAILED);
+                });
+            }
+        }
+        if (player == nullptr || paused) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            next_frame = std::chrono::steady_clock::now();
+            continue;
+        }
+        if (pending_playback_frames_.load() < kMaxQueuedPlaybackFrames) {
+            auto image = player->NextFrame(preview_width_, preview_height_);
+            if (image == nullptr) {
+                player->Rewind();  // Loop the clip.
+            } else {
+                pending_playback_frames_.fetch_add(1);
+                Application::GetInstance().Schedule([this, wanted, image]() {
+                    DisplayLockGuard lock(display_);
+                    pending_playback_frames_.fetch_sub(1);
+                    if (view_.load() != HomePageView::kGallery ||
+                        gallery_paths_.empty() ||
+                        gallery_paths_[gallery_index_] != wanted) {
+                        return;
+                    }
+                    ShowGalleryImage(image);
+                });
+            }
+        }
+        next_frame += std::chrono::microseconds(player->FrameIntervalUs());
+        const auto now = std::chrono::steady_clock::now();
+        if (next_frame < now) {
+            next_frame = now;
+        }
+        std::this_thread::sleep_until(next_frame);
+    }
+#endif
+}
+
+void HomePage::ToggleRecording() {
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    if (recording_.load()) {
+        StopRecording();
+    } else {
+        StartRecording();
+    }
+#endif
+}
+
+void HomePage::SetVideoIcon(const char* icon) {
+    if (video_label_ != nullptr) {
+        lv_label_set_text(video_label_, icon);
+    }
+}
+
+void HomePage::StartRecording() {
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    if (recording_.load()) {
+        return;
+    }
+    recording_.store(true);
+    // Do not reset the backlog counter here: tasks from a just-stopped
+    // recording may still be in flight and decrement it later.
+    next_video_frame_us_ = 0;
+    video_deadline_us_ = esp_timer_get_time() + kMaxVideoDurationUs;
+    SetVideoIcon(MATERIAL_SYMBOLS_STOP);
+    SetCameraHint(Lang::Strings::VIDEO_RECORDING);
+    // FIFO order guarantees this reset runs before the first frame task.
+    PostTask([this]() { video_start_failed_ = false; });
+#endif
+}
+
+void HomePage::StopRecording() {
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    if (!recording_.exchange(false)) {
+        return;
+    }
+    SetVideoIcon(MATERIAL_SYMBOLS_PLAY_ARROW);
+    SetCameraHint(Lang::Strings::PHOTO_SAVING);
+    PostTask([this]() {
+        std::string path;
+        if (recorder_ != nullptr) {
+            path = recorder_->Finish();
+            recorder_.reset();
+        }
+        Application::GetInstance().Schedule([this, path]() {
+            DisplayLockGuard lock(display_);
+            if (view_.load() != HomePageView::kCamera) {
+                return;
+            }
+            SetCameraHint(path.empty() ? Lang::Strings::VIDEO_FAILED
+                                       : Lang::Strings::VIDEO_SAVED);
         });
     });
 #endif
@@ -731,11 +1029,16 @@ void HomePage::StartWorker() {
         worker_running_ = true;
     }
     preview_running_.store(true);
+    playback_running_.store(true);
+    pending_video_frames_.store(0);
     io_thread_ = std::thread([this]() { IoLoop(); });
     preview_thread_ = std::thread([this]() { PreviewLoop(); });
+    playback_thread_ = std::thread([this]() { PlaybackLoop(); });
 }
 
 void HomePage::IoLoop() {
+    // Video encoding is CPU heavy; keep it below the LVGL and audio tasks.
+    TaskPriorityReset lower_priority(1);
     while (true) {
         std::function<void()> task;
         {
@@ -764,7 +1067,9 @@ void HomePage::PreviewLoop() {
             // routes it to the camera page while the camera page is visible.
             camera->Capture();
         }
-        next_frame += std::chrono::milliseconds(kPreviewIntervalMs);
+        const int interval_ms =
+            recording_.load() ? kRecordingPreviewIntervalMs : kPreviewIntervalMs;
+        next_frame += std::chrono::milliseconds(interval_ms);
         const auto now = std::chrono::steady_clock::now();
         if (next_frame < now) {
             next_frame = now;  // Never try to catch up on missed frames.
@@ -783,6 +1088,8 @@ void HomePage::PostTask(std::function<void()> task) {
 
 void HomePage::StopWorker() {
     preview_running_.store(false);
+    playback_running_.store(false);
+    recording_.store(false);
     if (io_thread_.joinable()) {
         {
             std::lock_guard<std::mutex> lock(worker_mutex_);
@@ -795,4 +1102,16 @@ void HomePage::StopWorker() {
     if (preview_thread_.joinable()) {
         preview_thread_.join();
     }
+    if (playback_thread_.joinable()) {
+        playback_thread_.join();
+    }
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    // The IO task has stopped, so a recording still in progress can be sealed
+    // here instead of leaving an unplayable AVI on the SD card.
+    if (recorder_ != nullptr) {
+        recorder_->Finish();
+        recorder_.reset();
+    }
+#endif
+    pending_video_frames_.store(0);
 }

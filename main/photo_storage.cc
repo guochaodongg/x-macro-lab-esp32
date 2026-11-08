@@ -41,6 +41,14 @@ constexpr uint8_t kJpegQuality = 80;
 
 std::string PhotoDir() { return CONFIG_XIAOZHI_PHOTO_STORAGE_DIR; }
 
+bool IsMediaFile(const std::string& name) {
+    if (name.size() <= 4) {
+        return false;
+    }
+    const std::string suffix = name.substr(name.size() - 4);
+    return suffix == ".JPG" || suffix == ".jpg" || suffix == ".AVI" || suffix == ".avi";
+}
+
 bool IsDirectory(const std::string& path) {
     struct stat st;
     return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
@@ -237,7 +245,7 @@ std::string PhotoStorage::SaveRgb565(uint8_t* data, size_t size, uint16_t width,
     return std::string(path);
 }
 
-std::vector<std::string> PhotoStorage::ListPhotos() {
+std::vector<std::string> PhotoStorage::ListMedia() {
     std::vector<std::string> paths;
     if (!EnsureMounted()) {
         return paths;
@@ -249,9 +257,7 @@ std::vector<std::string> PhotoStorage::ListPhotos() {
     }
     while (auto* entry = readdir(dp)) {
         std::string name = entry->d_name;
-        const size_t n = name.size();
-        if (n > 4 && (name.compare(n - 4, 4, ".JPG") == 0 ||
-                      name.compare(n - 4, 4, ".jpg") == 0)) {
+        if (IsMediaFile(name)) {
             paths.push_back(dir + "/" + name);
         }
     }
@@ -260,7 +266,7 @@ std::vector<std::string> PhotoStorage::ListPhotos() {
     return paths;
 }
 
-bool PhotoStorage::DeletePhoto(const std::string& path) {
+bool PhotoStorage::DeleteMedia(const std::string& path) {
     const std::string dir = PhotoDir() + "/";
     if (path.compare(0, dir.size(), dir) != 0 ||
         path.find('/', dir.size()) != std::string::npos) {
@@ -268,12 +274,8 @@ bool PhotoStorage::DeletePhoto(const std::string& path) {
         return false;
     }
     const std::string name = path.substr(dir.size());
-    if (name.size() <= 4) {
-        return false;
-    }
-    const size_t suffix = name.size() - 4;
-    if (name.compare(suffix, 4, ".JPG") != 0 && name.compare(suffix, 4, ".jpg") != 0) {
-        ESP_LOGE(TAG, "Refusing to delete non-photo %s", path.c_str());
+    if (!IsMediaFile(name)) {
+        ESP_LOGE(TAG, "Refusing to delete non-media %s", path.c_str());
         return false;
     }
     if (remove(path.c_str()) != 0 && errno != ENOENT) {
@@ -312,21 +314,383 @@ std::shared_ptr<LvglImage> PhotoStorage::LoadPhoto(const std::string& path, int 
         return nullptr;
     }
 
+    auto image = DecodeJpeg(jpeg, read_len, max_width, max_height);
+    heap_caps_free(jpeg);
+    if (image == nullptr) {
+        ESP_LOGE(TAG, "Failed to decode %s", path.c_str());
+    }
+    return image;
+}
+
+std::shared_ptr<LvglImage> PhotoStorage::DecodeJpeg(const uint8_t* data, size_t len,
+                                                    int max_width, int max_height) {
+    if (data == nullptr || len == 0) {
+        return nullptr;
+    }
     uint8_t* pixels = nullptr;
     size_t out_len = 0;
     size_t width = 0;
     size_t height = 0;
     size_t stride = 0;
-    esp_err_t ret = jpeg_to_image_fit(jpeg, read_len, max_width, max_height, &pixels, &out_len,
+    esp_err_t ret = jpeg_to_image_fit(data, len, max_width, max_height, &pixels, &out_len,
                                       &width, &height, &stride);
-    heap_caps_free(jpeg);
     if (ret != ESP_OK || pixels == nullptr) {
         if (pixels != nullptr) {
             heap_caps_free(pixels);
         }
-        ESP_LOGE(TAG, "Failed to decode %s: %s", path.c_str(), esp_err_to_name(ret));
+        ESP_LOGE(TAG, "JPEG decode failed: %s", esp_err_to_name(ret));
         return nullptr;
     }
     return std::make_shared<LvglAllocatedImage>(pixels, out_len, (int)width, (int)height,
                                                 (int)stride, LV_COLOR_FORMAT_RGB565);
+}
+
+namespace {
+constexpr uint8_t kVideoJpegQuality = 70;
+
+void WriteU16(FILE* file, uint16_t value) {
+    const uint8_t bytes[2] = {static_cast<uint8_t>(value),
+                              static_cast<uint8_t>(value >> 8)};
+    fwrite(bytes, 1, sizeof(bytes), file);
+}
+
+void WriteU32(FILE* file, uint32_t value) {
+    const uint8_t bytes[4] = {
+        static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8),
+        static_cast<uint8_t>(value >> 16), static_cast<uint8_t>(value >> 24)};
+    fwrite(bytes, 1, sizeof(bytes), file);
+}
+
+void WriteFourCC(FILE* file, const char* cc) { fwrite(cc, 1, 4, file); }
+
+uint32_t NextVideoIndex(const std::string& dir) {
+    uint32_t max_id = 0;
+    DIR* dp = opendir(dir.c_str());
+    if (dp == nullptr) {
+        return 1;
+    }
+    while (auto* entry = readdir(dp)) {
+        unsigned int id = 0;
+        if (sscanf(entry->d_name, "VID_%08u.AVI", &id) == 1 && id > max_id) {
+            max_id = id;
+        }
+    }
+    closedir(dp);
+    return max_id + 1;
+}
+}  // namespace
+
+std::shared_ptr<VideoRecorder> VideoRecorder::Start(uint16_t width, uint16_t height,
+                                                    uint8_t fps) {
+    if (width == 0 || height == 0 || fps == 0 || !EnsureMounted()) {
+        return nullptr;
+    }
+    const std::string dir = PhotoDir();
+    char path[256];
+    snprintf(path, sizeof(path), "%s/VID_%08u.AVI", dir.c_str(),
+             static_cast<unsigned>(NextVideoIndex(dir)));
+    FILE* file = fopen(path, "wb");
+    if (file == nullptr) {
+        ESP_LOGE(TAG, "Cannot create %s", path);
+        return nullptr;
+    }
+
+    auto recorder = std::shared_ptr<VideoRecorder>(new VideoRecorder());
+    recorder->file_ = file;
+    recorder->path_ = path;
+
+    // RIFF header; riff_size and frame counts are patched in Finish().
+    WriteFourCC(file, "RIFF");
+    WriteU32(file, 0);
+    WriteFourCC(file, "AVI ");
+
+    // hdrl LIST: 192 bytes of payload (avih 64 + strl LIST 124 + 'hdrl' 4).
+    WriteFourCC(file, "LIST");
+    WriteU32(file, 192);
+    WriteFourCC(file, "hdrl");
+    WriteFourCC(file, "avih");
+    WriteU32(file, 56);
+    WriteU32(file, 1000000U / fps);
+    WriteU32(file, static_cast<uint32_t>(width) * height * 2 * fps);
+    WriteU32(file, 0);
+    WriteU32(file, 0x10);  // AVIF_HASINDEX
+    WriteU32(file, 0);     // dwTotalFrames
+    WriteU32(file, 0);
+    WriteU32(file, 1);     // dwStreams
+    WriteU32(file, static_cast<uint32_t>(width) * height * 2);
+    WriteU32(file, width);
+    WriteU32(file, height);
+    for (int i = 0; i < 4; ++i) {
+        WriteU32(file, 0);
+    }
+
+    // strl LIST: 116 bytes of payload ('strl' 4 + strh 64 + strf 48).
+    WriteFourCC(file, "LIST");
+    WriteU32(file, 116);
+    WriteFourCC(file, "strl");
+    WriteFourCC(file, "strh");
+    WriteU32(file, 56);
+    WriteFourCC(file, "vids");
+    WriteFourCC(file, "MJPG");
+    WriteU32(file, 0);  // dwFlags
+    WriteU16(file, 0);  // wPriority
+    WriteU16(file, 0);  // wLanguage
+    WriteU32(file, 0);  // dwInitialFrames
+    WriteU32(file, 1);  // dwScale
+    WriteU32(file, fps);  // dwRate
+    WriteU32(file, 0);    // dwStart
+    WriteU32(file, 0);    // dwLength
+    WriteU32(file, static_cast<uint32_t>(width) * height * 2);
+    WriteU32(file, 0xFFFFFFFFU);  // dwQuality
+    WriteU32(file, 0);            // dwSampleSize
+    WriteU16(file, 0);
+    WriteU16(file, 0);
+    WriteU16(file, width);
+    WriteU16(file, height);
+
+    WriteFourCC(file, "strf");
+    WriteU32(file, 40);
+    WriteU32(file, 40);  // BITMAPINFOHEADER.biSize
+    WriteU32(file, width);
+    WriteU32(file, height);
+    WriteU16(file, 1);   // biPlanes
+    WriteU16(file, 24);  // biBitCount
+    WriteFourCC(file, "MJPG");  // biCompression
+    WriteU32(file, static_cast<uint32_t>(width) * height * 3);
+    for (int i = 0; i < 4; ++i) {
+        WriteU32(file, 0);
+    }
+
+    WriteFourCC(file, "LIST");
+    WriteU32(file, 4);  // movi LIST payload, patched in Finish()
+    WriteFourCC(file, "movi");
+    recorder->movi_data_start_ = ftell(file);
+    return recorder;
+}
+
+VideoRecorder::~VideoRecorder() {
+    if (file_ != nullptr) {
+        fclose(file_);
+        remove(path_.c_str());  // An unfinished AVI is not playable.
+    }
+}
+
+bool VideoRecorder::AddFrame(uint8_t* src, size_t size, uint16_t width, uint16_t height) {
+    if (file_ == nullptr || src == nullptr || width == 0 || height == 0 ||
+        size < static_cast<size_t>(width) * height * 2) {
+        return false;
+    }
+    uint8_t* jpeg = nullptr;
+    size_t jpeg_len = 0;
+    if (!image_to_jpeg(src, size, width, height, V4L2_PIX_FMT_RGB565, kVideoJpegQuality,
+                       &jpeg, &jpeg_len) ||
+        jpeg == nullptr || jpeg_len == 0) {
+        free(jpeg);
+        return false;
+    }
+    // idx1 offsets are relative to the 'movi' fourcc, so the first chunk is 4.
+    const uint32_t offset = static_cast<uint32_t>(ftell(file_) - (movi_data_start_ - 4));
+    WriteFourCC(file_, "00dc");
+    WriteU32(file_, static_cast<uint32_t>(jpeg_len));
+    const bool written = fwrite(jpeg, 1, jpeg_len, file_) == jpeg_len;
+    if ((jpeg_len & 1) != 0) {
+        fputc(0, file_);  // AVI chunks are word aligned.
+    }
+    free(jpeg);
+    if (!written) {
+        ESP_LOGE(TAG, "Failed to write video frame");
+        return false;
+    }
+    index_.push_back({offset, static_cast<uint32_t>(jpeg_len)});
+    ++frames_;
+    return true;
+}
+
+std::string VideoRecorder::Finish() {
+    if (file_ == nullptr) {
+        return {};
+    }
+    const uint32_t movi_data_len =
+        static_cast<uint32_t>(ftell(file_) - movi_data_start_);
+    const uint32_t index_bytes = static_cast<uint32_t>(index_.size()) * 16;
+    // 'AVI ' + hdrl chunk (200) + movi chunk (12 + data) + idx1 chunk (8 + index).
+    const uint32_t riff_size = 224 + movi_data_len + index_bytes;
+    fseek(file_, 4, SEEK_SET);
+    WriteU32(file_, riff_size);
+    fseek(file_, 48, SEEK_SET);
+    WriteU32(file_, frames_);  // avih.dwTotalFrames
+    fseek(file_, 140, SEEK_SET);
+    WriteU32(file_, frames_);  // strh.dwLength
+    fseek(file_, 216, SEEK_SET);
+    WriteU32(file_, 4 + movi_data_len);  // movi LIST payload
+    fseek(file_, 0, SEEK_END);
+    WriteFourCC(file_, "idx1");
+    WriteU32(file_, index_bytes);
+    for (const auto& entry : index_) {
+        WriteFourCC(file_, "00dc");
+        WriteU32(file_, 0x10);  // AVIIF_KEYFRAME
+        WriteU32(file_, entry.offset);
+        WriteU32(file_, entry.length);
+    }
+    fflush(file_);
+    fclose(file_);
+    file_ = nullptr;
+    if (frames_ == 0) {
+        remove(path_.c_str());
+        return {};
+    }
+    ESP_LOGI(TAG, "Saved %s (%u frames)", path_.c_str(), static_cast<unsigned>(frames_));
+    return path_;
+}
+
+namespace {
+constexpr uint32_t kMaxVideoFrameBytes = 512 * 1024;
+
+uint32_t ReadU32(FILE* file) {
+    uint8_t bytes[4];
+    if (fread(bytes, 1, 4, file) != 4) {
+        return 0;
+    }
+    return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
+           (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+void ReadFourCC(FILE* file, char out[5]) {
+    out[4] = '\0';
+    if (fread(out, 1, 4, file) != 4) {
+        out[0] = '\0';
+    }
+}
+}  // namespace
+
+std::shared_ptr<VideoPlayer> VideoPlayer::Open(const std::string& path) {
+    FILE* file = fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        return nullptr;
+    }
+    char riff[5];
+    char avi[5];
+    ReadFourCC(file, riff);
+    ReadU32(file);  // RIFF size
+    ReadFourCC(file, avi);
+    if (strcmp(riff, "RIFF") != 0 || strcmp(avi, "AVI ") != 0) {
+        fclose(file);
+        ESP_LOGE(TAG, "%s is not an AVI file", path.c_str());
+        return nullptr;
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return nullptr;
+    }
+    const long file_end = ftell(file);
+    long movi_start = 0;
+    long movi_end = 0;
+    uint32_t frame_interval_us = 100000;
+    long chunk = 12;
+    while (chunk + 8 <= file_end) {
+        if (fseek(file, chunk, SEEK_SET) != 0) {
+            break;
+        }
+        char id[5];
+        ReadFourCC(file, id);
+        const uint32_t size = ReadU32(file);
+        if (size < 4 || chunk + 8 + static_cast<long>(size) > file_end) {
+            break;
+        }
+        if (strcmp(id, "LIST") == 0) {
+            char type[5];
+            ReadFourCC(file, type);
+            if (strcmp(type, "movi") == 0) {
+                movi_start = ftell(file);
+                movi_end = std::min(file_end, movi_start + static_cast<long>(size - 4));
+                break;
+            }
+            if (strcmp(type, "hdrl") == 0) {
+                const long hdrl_end = chunk + 8 + static_cast<long>(size);
+                long sub = chunk + 12;
+                while (sub + 8 <= hdrl_end) {
+                    if (fseek(file, sub, SEEK_SET) != 0) {
+                        break;
+                    }
+                    char sub_id[5];
+                    ReadFourCC(file, sub_id);
+                    const uint32_t sub_size = ReadU32(file);
+                    if (sub_size == 0 || sub + 8 + static_cast<long>(sub_size) > hdrl_end) {
+                        break;
+                    }
+                    if (strcmp(sub_id, "avih") == 0) {
+                        const uint32_t us = ReadU32(file);
+                        if (us >= 10000 && us <= 1000000) {
+                            frame_interval_us = us;
+                        }
+                        break;
+                    }
+                    sub += 8 + static_cast<long>(sub_size);
+                }
+            }
+        }
+        chunk += 8 + static_cast<long>(size);
+    }
+    if (movi_start == 0 || movi_end <= movi_start) {
+        fclose(file);
+        ESP_LOGE(TAG, "%s has no movi list", path.c_str());
+        return nullptr;
+    }
+    auto player = std::shared_ptr<VideoPlayer>(new VideoPlayer());
+    player->file_ = file;
+    player->movi_data_start_ = movi_start;
+    player->movi_data_end_ = movi_end;
+    player->frame_interval_us_ = frame_interval_us;
+    fseek(file, movi_start, SEEK_SET);
+    return player;
+}
+
+VideoPlayer::~VideoPlayer() {
+    if (file_ != nullptr) {
+        fclose(file_);
+    }
+}
+
+void VideoPlayer::Rewind() {
+    if (file_ != nullptr) {
+        fseek(file_, movi_data_start_, SEEK_SET);
+    }
+}
+
+std::shared_ptr<LvglImage> VideoPlayer::NextFrame(int max_width, int max_height) {
+    if (file_ == nullptr) {
+        return nullptr;
+    }
+    while (true) {
+        const long pos = ftell(file_);
+        if (pos < 0 || pos + 8 > movi_data_end_) {
+            return nullptr;
+        }
+        char id[5];
+        ReadFourCC(file_, id);
+        const uint32_t size = ReadU32(file_);
+        if (size == 0 || pos + 8 + static_cast<long>(size) > movi_data_end_) {
+            return nullptr;
+        }
+        const long next = pos + 8 + static_cast<long>(size) + ((size & 1) ? 1 : 0);
+        if (strcmp(id, "00dc") != 0 || size > kMaxVideoFrameBytes) {
+            fseek(file_, next, SEEK_SET);
+            continue;
+        }
+        auto* jpeg = static_cast<uint8_t*>(
+            heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (jpeg == nullptr) {
+            return nullptr;
+        }
+        if (fread(jpeg, 1, size, file_) != size) {
+            heap_caps_free(jpeg);
+            return nullptr;
+        }
+        if (size & 1) {
+            fseek(file_, 1, SEEK_CUR);  // AVI chunks are word aligned.
+        }
+        auto image = PhotoStorage::DecodeJpeg(jpeg, size, max_width, max_height);
+        heap_caps_free(jpeg);
+        return image;
+    }
 }
