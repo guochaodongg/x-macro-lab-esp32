@@ -242,7 +242,8 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
 void AudioService::AudioInputTask() {
     constexpr EventBits_t kAudioInputActiveBits = AS_EVENT_AUDIO_TESTING_RUNNING |
                                                   AS_EVENT_WAKE_WORD_RUNNING |
-                                                  AS_EVENT_AUDIO_PROCESSOR_RUNNING;
+                                                  AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+                                                  AS_EVENT_AUDIO_CAPTURE_RUNNING;
 
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(
@@ -306,12 +307,21 @@ void AudioService::AudioInputTask() {
             }
         }
 
-        /* Feed the selected audio engine */
-        if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
+        /* Feed the selected audio engine and/or capture raw audio */
+        const bool feed_engine =
+            bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+        const bool capture = bits & AS_EVENT_AUDIO_CAPTURE_RUNNING;
+        if (feed_engine || capture) {
             int samples = 160;  // 10ms
             std::vector<int16_t> data;
             if (ReadAudioData(data, 16000, samples)) {
-                audio_engine_->Feed(std::move(data));
+                if (capture) {
+                    std::lock_guard<std::mutex> lock(capture_mutex_);
+                    capture_queue_.push_back(data);  // copies; drops if full
+                }
+                if (feed_engine) {
+                    audio_engine_->Feed(std::move(data));
+                }
                 continue;
             }
         }
@@ -321,6 +331,106 @@ void AudioService::AudioInputTask() {
     }
 
     ESP_LOGW(TAG, "Audio input task stopped");
+}
+
+void AudioService::EnableAudioCapture(bool enable) {
+    if (enable) {
+        // 16 kHz mono keeps the muxed audio compact and matches the rate the
+        // input task already produces (ReadAudioData resamples to 16 kHz).
+        capture_target_rate_ = 16000;
+        xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_CAPTURE_RUNNING);
+    } else {
+        xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_CAPTURE_RUNNING);
+        std::lock_guard<std::mutex> lock(capture_mutex_);
+        capture_queue_.clear();
+    }
+}
+
+bool AudioService::DrainCaptureAudio(std::vector<int16_t>& out) {
+    std::vector<int16_t> raw;
+    {
+        std::lock_guard<std::mutex> lock(capture_mutex_);
+        while (!capture_queue_.empty()) {
+            auto& frame = capture_queue_.front();
+            raw.insert(raw.end(), frame.begin(), frame.end());
+            capture_queue_.pop_front();
+        }
+    }
+    if (raw.empty()) {
+        return false;
+    }
+    // Downmix to mono. ReadAudioData preserves the codec input channel count.
+    const int channels = codec_->input_channels();
+    if (channels > 1) {
+        std::vector<int16_t> mono(raw.size() / static_cast<size_t>(channels));
+        for (size_t i = 0; i < mono.size(); ++i) {
+            int32_t sum = 0;
+            for (int c = 0; c < channels; ++c) {
+                sum += raw[i * channels + c];
+            }
+            mono[i] = static_cast<int16_t>(sum / channels);
+        }
+        raw = std::move(mono);
+    }
+    if (capture_target_rate_ > 0 && capture_target_rate_ != 16000) {
+        raw = ResampleMono(raw, 16000, capture_target_rate_);
+    }
+    out = std::move(raw);
+    return true;
+}
+
+void AudioService::PlayRawAudio(std::vector<int16_t>&& pcm, int src_rate) {
+    if (pcm.empty()) {
+        return;
+    }
+    static uint32_t raw_play_count_ = 0;
+    if ((raw_play_count_++ % 50) == 0) {
+        ESP_LOGI(TAG, "PlayRawAudio: %u samples src_rate=%d out_rate=%d",
+                 static_cast<unsigned>(pcm.size()), src_rate, codec_->output_sample_rate());
+    }
+    const int out_rate = codec_->output_sample_rate();
+    if (src_rate > 0 && src_rate != out_rate) {
+        pcm = ResampleMono(pcm, src_rate, out_rate);
+    }
+    if (!codec_->output_enabled()) {
+        esp_timer_stop(audio_power_timer_);
+        esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+        codec_->EnableOutput(true);
+    }
+    AudioTask task;
+    task.type = kAudioTaskTypeRawPlayback;
+    task.pcm = std::move(pcm);
+    task.playback_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        // Keep the queue bounded so a stalled player cannot exhaust memory.
+        if (audio_playback_queue_.size() >= MAX_PLAYBACK_TASKS_IN_QUEUE) {
+            return;
+        }
+        audio_playback_queue_.push_back(std::move(task));
+    }
+    audio_queue_cv_.notify_all();
+}
+
+std::vector<int16_t> AudioService::ResampleMono(const std::vector<int16_t>& in, int in_rate,
+                                                int out_rate) {
+    if (in.empty() || out_rate == in_rate) {
+        return in;
+    }
+    const size_t out_n = static_cast<size_t>(in.size()) * out_rate / in_rate;
+    std::vector<int16_t> out(out_n);
+    const double ratio = static_cast<double>(in_rate) / out_rate;
+    for (size_t i = 0; i < out_n; ++i) {
+        const double pos = i * ratio;
+        const size_t i0 = static_cast<size_t>(pos);
+        const size_t i1 = std::min(i0 + 1, in.size() - 1);
+        const double frac = pos - i0;
+        const int32_t v =
+            static_cast<int32_t>(in[i0] * (1.0 - frac) + in[i1] * frac);
+        const int32_t clamped = v < -32768 ? -32768 : (v > 32767 ? 32767 : v);
+        out[i] = static_cast<int16_t>(clamped);
+    }
+    return out;
 }
 
 void AudioService::AudioOutputTask() {

@@ -39,7 +39,10 @@
 
 #define OPUS_FRAME_DURATION_MS 60
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
-#define MAX_PLAYBACK_TASKS_IN_QUEUE 2
+// Raised from 2 to give the camera/album raw-audio path enough buffering so
+// 100 ms PCM chunks do not get dropped between frames. TTS decode look-ahead
+// grows slightly but stays well within limits.
+#define MAX_PLAYBACK_TASKS_IN_QUEUE 16
 #define MAX_DECODE_PACKETS_IN_QUEUE (1200 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
@@ -52,6 +55,9 @@
 #define AS_EVENT_WAKE_WORD_RUNNING (1 << 1)
 #define AS_EVENT_AUDIO_PROCESSOR_RUNNING (1 << 2)
 #define AS_EVENT_AUDIO_INPUT_STOP_REQUEST (1 << 4)
+// Set while the camera/album feature records ambient audio. Keeps the input
+// task reading the mic and copies those frames into a capture ring buffer.
+#define AS_EVENT_AUDIO_CAPTURE_RUNNING (1 << 5)
 
 #define AS_OPUS_GET_FRAME_DRU_ENUM(duration_ms)                  \
     ((duration_ms) == 5     ? ESP_OPUS_ENC_FRAME_DURATION_5_MS   \
@@ -93,6 +99,8 @@ enum AudioTaskType {
     kAudioTaskTypeEncodeToSendQueue,
     kAudioTaskTypeEncodeToTestingQueue,
     kAudioTaskTypeDecodeToPlaybackQueue,
+    // Raw PCM destined straight for the speaker, bypassing Opus decode.
+    kAudioTaskTypeRawPlayback,
 };
 
 struct AudioTask {
@@ -141,6 +149,17 @@ public:
     void EnableDeviceAec(bool enable);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
+
+    // Camera/album audio capture. While enabled, the input task copies each mic
+    // frame into a ring buffer; DrainCaptureAudio() removes and returns them.
+    // Captured audio is resampled to 16 kHz mono so it can be muxed into a video
+    // file and later played back through PlayRawAudio().
+    void EnableAudioCapture(bool enable);
+    bool DrainCaptureAudio(std::vector<int16_t>& out);
+
+    // Plays raw PCM through the speaker. src_rate is the captured sample rate
+    // (typically 16000); the data is resampled to the codec output rate.
+    void PlayRawAudio(std::vector<int16_t>&& pcm, int src_rate = 16000);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
@@ -221,6 +240,14 @@ private:
     void CheckAndUpdateAudioPowerState();
     bool IsPlaybackDrainedLocked() const;
     bool MarkPlaybackDrainedLocked();
+
+    // Linear-interpolation mono resampler used for capture/playback bridging.
+    static std::vector<int16_t> ResampleMono(const std::vector<int16_t>& in, int in_rate,
+                                            int out_rate);
+
+    FixedQueue<std::vector<int16_t>, 256> capture_queue_;
+    std::mutex capture_mutex_;
+    int capture_target_rate_ = 0;
 };
 
 #endif

@@ -76,6 +76,9 @@ private:
     void StartPlayback(const std::string& path);
     void StopPlayback();
     void SetPlayIcon(const char* icon);
+    void ChangePlaybackVolume(int delta);
+    void UpdatePlaybackProgress(int pos_ms, int dur_ms);
+    void SetPlaybackControlsVisible(bool visible);
     void RequestDeletePhoto();
     void CancelDelete();
     void ToggleRecording();
@@ -118,6 +121,10 @@ private:
     lv_obj_t* gallery_delete_label_ = nullptr;
     lv_obj_t* video_play_button_ = nullptr;
     lv_obj_t* video_play_label_ = nullptr;
+    lv_obj_t* gallery_vol_up_button_ = nullptr;
+    lv_obj_t* gallery_vol_down_button_ = nullptr;
+    lv_obj_t* gallery_progress_bar_ = nullptr;
+    lv_obj_t* gallery_progress_label_ = nullptr;
 
     std::atomic<HomePageView> view_{HomePageView::kAiChat};
     std::unique_ptr<LvglImage> camera_frame_;

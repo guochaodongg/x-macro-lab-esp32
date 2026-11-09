@@ -2,6 +2,7 @@
 
 #include "application.h"
 #include "assets/lang_config.h"
+#include "audio_service.h"
 #include "board.h"
 #include "camera.h"
 #include "lvgl_image.h"
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -39,6 +41,15 @@ constexpr int64_t kVideoFrameIntervalUs = 1000000 / kVideoFps;
 constexpr int64_t kMaxVideoDurationUs = 30 * 1000000;
 constexpr int kMaxQueuedVideoFrames = 3;
 constexpr int kMaxQueuedPlaybackFrames = 2;
+// Mic recordings sit well below full scale. A small fixed gain on gallery
+// playback only (never on the shared audio pipeline) makes them audible
+// without forcing the codec volume to its maximum.
+constexpr int kPlaybackGain = 3;
+// A clip starts and stops at the DAC idle level. Ramp at the session
+// boundaries and remove the mic DC offset so the step between silence and
+// the captured waveform is not heard as a "pop" at the start/end of playback.
+constexpr size_t kPlaybackFadeSamples = 48;   // 3 ms at 16 kHz
+constexpr size_t kPlaybackTailSamples = 160;  // 10 ms of silence
 #endif
 
 void SetObjectVisible(lv_obj_t* obj, bool visible) {
@@ -59,6 +70,56 @@ bool IsVideoPath(const std::string& path) {
     }
     const std::string suffix = path.substr(path.size() - 4);
     return suffix == ".AVI" || suffix == ".avi";
+}
+
+void FormatTime(char* buf, size_t n, int ms) {
+    if (ms < 0) {
+        ms = 0;
+    }
+    const int total = ms / 1000;
+    const int mm = total / 60;
+    const int ss = total % 60;
+    snprintf(buf, n, "%02d:%02d", mm, ss);
+}
+
+// "VID_00000001.AVI" -> "V1", "IMG_00000012.JPG" -> "P12". Keeps just
+// enough of the name to identify the file in the compact caption.
+std::string ShortMediaName(const char* name) {
+    const char* dot = strrchr(name, '.');
+    std::string stem =
+        dot != nullptr ? std::string(name, static_cast<size_t>(dot - name)) : std::string(name);
+    std::string tag;
+    if (stem.rfind("VID_", 0) == 0) {
+        tag = "V";
+        stem.erase(0, 4);
+    } else if (stem.rfind("IMG_", 0) == 0) {
+        tag = "P";
+        stem.erase(0, 4);
+    }
+    const size_t first = stem.find_first_not_of('0');
+    stem = first == std::string::npos ? "0" : stem.substr(first);
+    if (stem.size() > 8) {
+        stem.resize(8);
+    }
+    return tag + stem;
+}
+
+// Remove the microphone DC offset with a ~20 Hz one-pole high-pass, then apply
+// the playback-only gain. dc_state is carried across chunks so the filter does
+// not restart (and click) on every AVI audio chunk. The first chunk of a
+// session additionally ramps in from zero.
+void ShapePlaybackAudio(std::vector<int16_t>& pcm, int32_t& dc_state, bool fade_in) {
+    const size_t fade = std::min(kPlaybackFadeSamples, pcm.size());
+    for (size_t i = 0; i < pcm.size(); ++i) {
+        const int32_t raw = pcm[i];
+        dc_state += (raw * 256 - dc_state) / 128;
+        const int32_t filtered = raw - dc_state / 256;
+        int32_t amplified = std::clamp<int32_t>(filtered * kPlaybackGain, INT16_MIN, INT16_MAX);
+        if (fade_in && i < fade) {
+            amplified = amplified * static_cast<int32_t>(i + 1) / static_cast<int32_t>(fade);
+        }
+        pcm[i] = static_cast<int16_t>(amplified);
+    }
 }
 #endif
 
@@ -90,8 +151,8 @@ void FitImage(lv_obj_t* image, const lv_img_dsc_t* dsc, int box_width, int box_h
     if (img_width <= 0 || img_height <= 0) {
         return;
     }
-    int32_t zoom = std::min<int32_t>((box_width * 256) / img_width,
-                                     (box_height * 256) / img_height);
+    int32_t zoom =
+        std::min<int32_t>((box_width * 256) / img_width, (box_height * 256) / img_height);
     zoom = std::min<int32_t>(zoom, 256);
     if (zoom > 0) {
         lv_image_set_scale(image, zoom);
@@ -131,8 +192,7 @@ std::shared_ptr<CapturedFrame> CopyRgb565Frame(const lv_img_dsc_t* dsc) {
         return nullptr;
     }
     const size_t size = width * height * 2;
-    auto* data =
-        static_cast<uint8_t*>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    auto* data = static_cast<uint8_t*>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (data == nullptr) {
         return nullptr;
     }
@@ -243,7 +303,12 @@ void HomePage::CreateUi(LvglTheme* theme) {
     preview_width_ = width_;
     preview_height_ = height_;
     const int icon_vertical_offset = std::max(0, (shutter_size - icon_size) / 2);
-    const int info_vertical_offset = std::max(0, (shutter_size - line_height) / 2);
+    // The file caption sits at the top center; playback progress and its timer
+    // sit at the bottom center, clear of the volume buttons in both corners.
+    const int info_top = margin + icon_size + 4;
+    const int info_width = preview_width_ * 80 / 100;
+    const int progress_width = preview_width_ * 60 / 100;
+    const int progress_bottom = margin + 2;
 
     home_root_ = CreateRoot(screen, width_, height_, padding);
     auto* home_title = lv_label_create(home_root_);
@@ -273,8 +338,7 @@ void HomePage::CreateUi(LvglTheme* theme) {
     gallery_button_ = CreateIconButton(camera_root_, MATERIAL_SYMBOLS_IMAGE, icon_size);
     lv_obj_align(gallery_button_, LV_ALIGN_BOTTOM_LEFT, margin + 4,
                  -(margin + icon_vertical_offset));
-    capture_button_ =
-        CreateIconButton(camera_root_, MATERIAL_SYMBOLS_PHOTO_CAMERA, shutter_size);
+    capture_button_ = CreateIconButton(camera_root_, MATERIAL_SYMBOLS_PHOTO_CAMERA, shutter_size);
     lv_obj_align(capture_button_, LV_ALIGN_BOTTOM_MID, 0, -margin);
     capture_label_ = lv_obj_get_child(capture_button_, 0);
     video_button_ = CreateIconButton(camera_root_, MATERIAL_SYMBOLS_PLAY_ARROW, icon_size);
@@ -289,14 +353,16 @@ void HomePage::CreateUi(LvglTheme* theme) {
     lv_obj_set_pos(gallery_box_, 0, 0);
     gallery_info_ = lv_label_create(gallery_root_);
     lv_label_set_text(gallery_info_, Lang::Strings::GALLERY_LOADING);
-    lv_obj_set_width(gallery_info_, preview_width_);
+    lv_obj_set_width(gallery_info_, info_width);
+    lv_label_set_long_mode(gallery_info_, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_align(gallery_info_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_bg_opa(gallery_info_, LV_OPA_70, 0);
     lv_obj_set_style_pad_all(gallery_info_, 2, 0);
     lv_obj_set_style_radius(gallery_info_, 4, 0);
-    lv_obj_align(gallery_info_, LV_ALIGN_BOTTOM_MID, 0, -(margin + info_vertical_offset));
-    gallery_back_button_ =
-        CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_ARROW_BACK, icon_size);
+    // 256 is 100%; shrink the glyphs without needing an extra font asset.
+    lv_obj_set_style_transform_scale(gallery_info_, 190, 0);
+    lv_obj_align(gallery_info_, LV_ALIGN_TOP_MID, 0, info_top);
+    gallery_back_button_ = CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_ARROW_BACK, icon_size);
     lv_obj_align(gallery_back_button_, LV_ALIGN_TOP_LEFT, margin + 2, margin + 2);
     gallery_prev_button_ =
         CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_KEYBOARD_ARROW_LEFT, icon_size);
@@ -304,14 +370,49 @@ void HomePage::CreateUi(LvglTheme* theme) {
     gallery_next_button_ =
         CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_KEYBOARD_ARROW_RIGHT, icon_size);
     lv_obj_align(gallery_next_button_, LV_ALIGN_RIGHT_MID, -(margin + 2), 0);
-    gallery_delete_button_ =
-        CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_DELETE, icon_size);
+    gallery_delete_button_ = CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_DELETE, icon_size);
     lv_obj_align(gallery_delete_button_, LV_ALIGN_TOP_RIGHT, -(margin + 2), margin + 2);
     gallery_delete_label_ = lv_obj_get_child(gallery_delete_button_, 0);
     video_play_button_ = CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_PAUSE, icon_size);
-    lv_obj_align(video_play_button_, LV_ALIGN_TOP_RIGHT,
-                 -(margin + 2 + icon_size + 4), margin + 2);
+    lv_obj_align(video_play_button_, LV_ALIGN_TOP_RIGHT, -(margin + 2 + icon_size + 4), margin + 2);
     video_play_label_ = lv_obj_get_child(video_play_button_, 0);
+
+    // Volume +/- and a playback progress bar + timer, shown only while a video
+    // is playing (see SetPlaybackControlsVisible).
+    gallery_vol_down_button_ =
+        CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_VOLUME_DOWN, icon_size);
+    lv_obj_align(gallery_vol_down_button_, LV_ALIGN_BOTTOM_LEFT, margin + 2, -(margin + 2));
+    gallery_vol_up_button_ = CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_VOLUME_UP, icon_size);
+    lv_obj_align(gallery_vol_up_button_, LV_ALIGN_BOTTOM_RIGHT, -(margin + 2), -(margin + 2));
+
+    gallery_progress_bar_ = lv_bar_create(gallery_root_);
+    lv_obj_set_size(gallery_progress_bar_, progress_width, 5);
+    lv_obj_align(gallery_progress_bar_, LV_ALIGN_BOTTOM_MID, 0, -progress_bottom);
+    lv_bar_set_range(gallery_progress_bar_, 0, 1000);
+    lv_bar_set_value(gallery_progress_bar_, 0, LV_ANIM_OFF);
+
+    gallery_progress_label_ = lv_label_create(gallery_root_);
+    lv_label_set_text(gallery_progress_label_, "00:00 / 00:00");
+    lv_obj_set_width(gallery_progress_label_, progress_width);
+    lv_obj_set_style_text_align(gallery_progress_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_opa(gallery_progress_label_, LV_OPA_70, 0);
+    lv_obj_set_style_pad_all(gallery_progress_label_, 2, 0);
+    lv_obj_set_style_radius(gallery_progress_label_, 4, 0);
+    lv_obj_set_style_transform_scale(gallery_progress_label_, 190, 0);
+    lv_obj_align_to(gallery_progress_label_, gallery_progress_bar_, LV_ALIGN_OUT_TOP_MID, 0, 0);
+
+    lv_obj_add_event_cb(
+        gallery_vol_up_button_,
+        [](lv_event_t* e) {
+            static_cast<HomePage*>(lv_event_get_user_data(e))->ChangePlaybackVolume(10);
+        },
+        LV_EVENT_CLICKED, this);
+    lv_obj_add_event_cb(
+        gallery_vol_down_button_,
+        [](lv_event_t* e) {
+            static_cast<HomePage*>(lv_event_get_user_data(e))->ChangePlaybackVolume(-10);
+        },
+        LV_EVENT_CLICKED, this);
 
     // Small floating entry back to the launcher, only visible on the chat screen.
     home_button_ = CreateIconButton(screen, MATERIAL_SYMBOLS_HOME, icon_size);
@@ -393,21 +494,15 @@ void HomePage::CreateUi(LvglTheme* theme) {
         LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
         video_play_button_,
-        [](lv_event_t* e) {
-            static_cast<HomePage*>(lv_event_get_user_data(e))->TogglePlayback();
-        },
+        [](lv_event_t* e) { static_cast<HomePage*>(lv_event_get_user_data(e))->TogglePlayback(); },
         LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
         capture_button_,
-        [](lv_event_t* e) {
-            static_cast<HomePage*>(lv_event_get_user_data(e))->CapturePhoto();
-        },
+        [](lv_event_t* e) { static_cast<HomePage*>(lv_event_get_user_data(e))->CapturePhoto(); },
         LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
         video_button_,
-        [](lv_event_t* e) {
-            static_cast<HomePage*>(lv_event_get_user_data(e))->ToggleRecording();
-        },
+        [](lv_event_t* e) { static_cast<HomePage*>(lv_event_get_user_data(e))->ToggleRecording(); },
         LV_EVENT_CLICKED, this);
 
     // Every hint is transient: it appears on entering the camera page (and on
@@ -428,6 +523,10 @@ void HomePage::CreateUi(LvglTheme* theme) {
     SetObjectVisible(home_button_, false);
     SetObjectVisible(camera_hint_, false);
     SetObjectVisible(video_play_button_, false);
+    SetObjectVisible(gallery_vol_up_button_, false);
+    SetObjectVisible(gallery_vol_down_button_, false);
+    SetObjectVisible(gallery_progress_bar_, false);
+    SetObjectVisible(gallery_progress_label_, false);
 #if !CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
     SetObjectVisible(gallery_button_, false);
     SetObjectVisible(gallery_delete_button_, false);
@@ -452,10 +551,10 @@ void HomePage::ApplyTheme(LvglTheme* theme) {
             lv_obj_set_style_bg_color(box, theme->chat_background_color(), 0);
         }
     }
-    for (auto* button : {camera_button_, ai_button_, capture_button_, gallery_button_,
-                         back_button_, video_button_, gallery_prev_button_,
-                         gallery_next_button_, gallery_back_button_, gallery_delete_button_,
-                         video_play_button_, home_button_}) {
+    for (auto* button :
+         {camera_button_, ai_button_, capture_button_, gallery_button_, back_button_, video_button_,
+          gallery_prev_button_, gallery_next_button_, gallery_back_button_, gallery_delete_button_,
+          video_play_button_, gallery_vol_up_button_, gallery_vol_down_button_, home_button_}) {
         if (button == nullptr) {
             continue;
         }
@@ -463,7 +562,7 @@ void HomePage::ApplyTheme(LvglTheme* theme) {
         lv_obj_set_style_border_color(button, theme->border_color(), 0);
         lv_obj_set_style_text_color(button, theme->text_color(), 0);
     }
-    for (auto* label : {camera_hint_, gallery_info_}) {
+    for (auto* label : {camera_hint_, gallery_info_, gallery_progress_label_}) {
         if (label == nullptr) {
             continue;
         }
@@ -518,9 +617,8 @@ void HomePage::CapturePhoto() {
 #endif
         // PlaySound() wakes the audio pipeline; route it through the main task
         // so it never runs while the LVGL lock is held.
-        Application::GetInstance().Schedule([]() {
-            Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
-        });
+        Application::GetInstance().Schedule(
+            []() { Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP); });
     }
 #if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
     if (taking_photo) {
@@ -541,9 +639,7 @@ void HomePage::CapturePhoto() {
 #endif
 }
 
-bool HomePage::IsCameraPageVisible() const {
-    return view_.load() == HomePageView::kCamera;
-}
+bool HomePage::IsCameraPageVisible() const { return view_.load() == HomePageView::kCamera; }
 
 bool HomePage::IsOverlayVisible() const {
     const auto view = view_.load();
@@ -634,13 +730,25 @@ void HomePage::SetCameraFrame(std::unique_ptr<LvglImage> image) {
                 pending_video_frames_.fetch_add(1);
                 PostTask([this, video_frame]() {
                     if (recorder_ == nullptr && !video_start_failed_) {
-                        recorder_ = VideoRecorder::Start(video_frame->width,
-                                                         video_frame->height, kVideoFps);
+                        auto* codec = Board::GetInstance().GetAudioCodec();
+                        // Captured audio is always resampled to 16 kHz mono by the
+                        // AudioService input task, so we mux at 16 kHz and let
+                        // PlayRawAudio resample to the codec output rate on playback.
+                        const int audio_rate =
+                            (codec != nullptr && codec->input_sample_rate() > 0) ? 16000 : 0;
+                        recorder_ = VideoRecorder::Start(video_frame->width, video_frame->height,
+                                                         kVideoFps, audio_rate, 1, 16);
                         video_start_failed_ = recorder_ == nullptr;
                     }
                     if (recorder_ != nullptr) {
                         recorder_->AddFrame(video_frame->data, video_frame->size,
                                             video_frame->width, video_frame->height);
+                        std::vector<int16_t> pcm;
+                        if (Application::GetInstance().GetAudioService().DrainCaptureAudio(pcm) &&
+                            !pcm.empty()) {
+                            recorder_->AddAudio(reinterpret_cast<const uint8_t*>(pcm.data()),
+                                                pcm.size() * sizeof(int16_t));
+                        }
                     }
                     pending_video_frames_.fetch_sub(1);
                 });
@@ -759,17 +867,20 @@ void HomePage::RequestGalleryMedia() {
         StartPlayback(path);
         SetObjectVisible(video_play_button_, true);
         SetPlayIcon(MATERIAL_SYMBOLS_PAUSE);
+        SetPlaybackControlsVisible(true);
         // Drop the previous photo before the first video frame is decoded.
         lv_image_set_src(gallery_image_, nullptr);
         gallery_frame_.reset();
         SetObjectVisible(gallery_image_, false);
-        snprintf(info, sizeof(info), "%s %u/%u %s", Lang::Strings::GALLERY_VIDEO,
-                 (unsigned)(gallery_index_ + 1), (unsigned)gallery_paths_.size(), name);
+        const std::string short_name = ShortMediaName(name);
+        snprintf(info, sizeof(info), "%.8s %u/%u", short_name.c_str(),
+                 (unsigned)(gallery_index_ + 1), (unsigned)gallery_paths_.size());
         SetGalleryInfo(info);
         return;
     }
     StopPlayback();
     SetObjectVisible(video_play_button_, false);
+    SetPlaybackControlsVisible(false);
     SetGalleryInfo(Lang::Strings::GALLERY_LOADING);
     PostTask([this, path]() {
         auto image = PhotoStorage::LoadPhoto(path, preview_width_, preview_height_);
@@ -785,9 +896,10 @@ void HomePage::RequestGalleryMedia() {
             ShowGalleryImage(decoded);
             const char* slash = strrchr(path.c_str(), '/');
             const char* name = slash == nullptr ? path.c_str() : slash + 1;
+            const std::string short_name = ShortMediaName(name);
             char info[128];
-            snprintf(info, sizeof(info), "%u/%u %s", (unsigned)(gallery_index_ + 1),
-                     (unsigned)gallery_paths_.size(), name);
+            snprintf(info, sizeof(info), "%.8s %u/%u", short_name.c_str(),
+                     (unsigned)(gallery_index_ + 1), (unsigned)gallery_paths_.size());
             SetGalleryInfo(info);
         });
     });
@@ -862,6 +974,62 @@ void HomePage::SetPlayIcon(const char* icon) {
     }
 }
 
+void HomePage::ChangePlaybackVolume(int delta) {
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    if (codec == nullptr) {
+        return;
+    }
+    int volume = codec->output_volume() + delta;
+    if (volume < 0) {
+        volume = 0;
+    } else if (volume > 100) {
+        volume = 100;
+    }
+    codec->SetOutputVolume(volume);
+    char msg[32];
+    snprintf(msg, sizeof(msg), "%s %d", Lang::Strings::VOLUME, volume / 10);
+    auto* display = Board::GetInstance().GetDisplay();
+    if (display != nullptr) {
+        display->ShowNotification(msg);
+    }
+#endif
+}
+
+void HomePage::UpdatePlaybackProgress(int pos_ms, int dur_ms) {
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    if (gallery_progress_bar_ == nullptr || gallery_progress_label_ == nullptr) {
+        return;
+    }
+    int percent = 0;
+    if (dur_ms > 0) {
+        percent = (pos_ms * 1000) / dur_ms;
+        if (percent < 0) {
+            percent = 0;
+        } else if (percent > 1000) {
+            percent = 1000;
+        }
+    }
+    lv_bar_set_value(gallery_progress_bar_, percent, LV_ANIM_OFF);
+    char pos[16];
+    char dur[16];
+    FormatTime(pos, sizeof(pos), pos_ms);
+    FormatTime(dur, sizeof(dur), dur_ms);
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%s / %s", pos, dur);
+    lv_label_set_text(gallery_progress_label_, buf);
+#endif
+}
+
+void HomePage::SetPlaybackControlsVisible(bool visible) {
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    SetObjectVisible(gallery_vol_up_button_, visible);
+    SetObjectVisible(gallery_vol_down_button_, visible);
+    SetObjectVisible(gallery_progress_bar_, visible);
+    SetObjectVisible(gallery_progress_label_, visible);
+#endif
+}
+
 void HomePage::StartPlayback(const std::string& path) {
     std::lock_guard<std::mutex> lock(playback_mutex_);
     playback_path_ = path;
@@ -897,6 +1065,30 @@ void HomePage::PlaybackLoop() {
     std::string current_path;
     std::shared_ptr<VideoPlayer> player;
     auto next_frame = std::chrono::steady_clock::now();
+    int32_t dc_state = 0;
+    bool fade_in = true;
+    bool audio_active = false;
+    int16_t last_sample = 0;
+
+    // End every playback session at zero: ramp the last queued level down and
+    // pad with silence so the codec/PA is switched off while the DAC is idle.
+    auto finish_audio = [&]() {
+        if (!audio_active) {
+            return;
+        }
+        std::vector<int16_t> tail(kPlaybackFadeSamples + kPlaybackTailSamples, 0);
+        for (size_t i = 0; i < kPlaybackFadeSamples; ++i) {
+            tail[i] = static_cast<int16_t>(static_cast<int32_t>(last_sample) *
+                                           static_cast<int32_t>(kPlaybackFadeSamples - i) /
+                                           static_cast<int32_t>(kPlaybackFadeSamples));
+        }
+        Application::GetInstance().GetAudioService().PlayRawAudio(std::move(tail), 16000);
+        audio_active = false;
+        fade_in = true;
+        dc_state = 0;
+        last_sample = 0;
+    };
+
     while (playback_running_.load()) {
         std::string wanted;
         bool paused = false;
@@ -904,6 +1096,9 @@ void HomePage::PlaybackLoop() {
             std::lock_guard<std::mutex> lock(playback_mutex_);
             wanted = playback_path_;
             paused = playback_paused_;
+        }
+        if (wanted.empty() || wanted != current_path || paused || player == nullptr) {
+            finish_audio();
         }
         if (wanted.empty()) {
             player.reset();
@@ -919,8 +1114,7 @@ void HomePage::PlaybackLoop() {
             if (player == nullptr) {
                 Application::GetInstance().Schedule([this, wanted]() {
                     DisplayLockGuard lock(display_);
-                    if (view_.load() != HomePageView::kGallery ||
-                        gallery_paths_.empty() ||
+                    if (view_.load() != HomePageView::kGallery || gallery_paths_.empty() ||
                         gallery_paths_[gallery_index_] != wanted) {
                         return;
                     }
@@ -936,19 +1130,33 @@ void HomePage::PlaybackLoop() {
         if (pending_playback_frames_.load() < kMaxQueuedPlaybackFrames) {
             auto image = player->NextFrame(preview_width_, preview_height_);
             if (image == nullptr) {
+                finish_audio();    // Smooth the loop seam before rewinding.
                 player->Rewind();  // Loop the clip.
             } else {
                 pending_playback_frames_.fetch_add(1);
-                Application::GetInstance().Schedule([this, wanted, image]() {
+                const int pos_ms = player->PositionMs();
+                const int dur_ms = player->DurationMs();
+                Application::GetInstance().Schedule([this, wanted, image, pos_ms, dur_ms]() {
                     DisplayLockGuard lock(display_);
                     pending_playback_frames_.fetch_sub(1);
-                    if (view_.load() != HomePageView::kGallery ||
-                        gallery_paths_.empty() ||
+                    if (view_.load() != HomePageView::kGallery || gallery_paths_.empty() ||
                         gallery_paths_[gallery_index_] != wanted) {
                         return;
                     }
                     ShowGalleryImage(image);
+                    UpdatePlaybackProgress(pos_ms, dur_ms);
                 });
+                // Play the audio chunk that follows this video frame. The recorder
+                // interleaves one "01wb" chunk per frame, so this stays in sync.
+                std::vector<int16_t> pcm;
+                if (player->NextAudio(pcm) && !pcm.empty()) {
+                    ShapePlaybackAudio(pcm, dc_state, fade_in);
+                    fade_in = false;
+                    audio_active = true;
+                    last_sample = pcm.back();
+                    Application::GetInstance().GetAudioService().PlayRawAudio(std::move(pcm),
+                                                                              16000);
+                }
             }
         }
         next_frame += std::chrono::microseconds(player->FrameIntervalUs());
@@ -958,6 +1166,7 @@ void HomePage::PlaybackLoop() {
         }
         std::this_thread::sleep_until(next_frame);
     }
+    finish_audio();
 #endif
 }
 
@@ -989,6 +1198,9 @@ void HomePage::StartRecording() {
     video_deadline_us_ = esp_timer_get_time() + kMaxVideoDurationUs;
     SetVideoIcon(MATERIAL_SYMBOLS_STOP);
     SetCameraHint(Lang::Strings::VIDEO_RECORDING);
+    // Start tapping the mic; the AudioService input task copies frames into a
+    // ring buffer that the recording task drains into the AVI.
+    Application::GetInstance().GetAudioService().EnableAudioCapture(true);
     // FIFO order guarantees this reset runs before the first frame task.
     PostTask([this]() { video_start_failed_ = false; });
 #endif
@@ -1002,6 +1214,14 @@ void HomePage::StopRecording() {
     SetVideoIcon(MATERIAL_SYMBOLS_PLAY_ARROW);
     SetCameraHint(Lang::Strings::PHOTO_SAVING);
     PostTask([this]() {
+        auto& audio = Application::GetInstance().GetAudioService();
+        // Flush any audio captured since the last frame before sealing the file.
+        std::vector<int16_t> pcm;
+        if (recorder_ != nullptr && audio.DrainCaptureAudio(pcm) && !pcm.empty()) {
+            recorder_->AddAudio(reinterpret_cast<const uint8_t*>(pcm.data()),
+                                pcm.size() * sizeof(int16_t));
+        }
+        audio.EnableAudioCapture(false);
         std::string path;
         if (recorder_ != nullptr) {
             path = recorder_->Finish();
@@ -1012,8 +1232,7 @@ void HomePage::StopRecording() {
             if (view_.load() != HomePageView::kCamera) {
                 return;
             }
-            SetCameraHint(path.empty() ? Lang::Strings::VIDEO_FAILED
-                                       : Lang::Strings::VIDEO_SAVED);
+            SetCameraHint(path.empty() ? Lang::Strings::VIDEO_FAILED : Lang::Strings::VIDEO_SAVED);
         });
     });
 #endif
@@ -1043,8 +1262,7 @@ void HomePage::IoLoop() {
         std::function<void()> task;
         {
             std::unique_lock<std::mutex> lock(worker_mutex_);
-            worker_cv_.wait(lock,
-                            [this] { return !worker_running_ || !worker_tasks_.empty(); });
+            worker_cv_.wait(lock, [this] { return !worker_running_ || !worker_tasks_.empty(); });
             if (!worker_running_) {
                 break;
             }
@@ -1061,8 +1279,7 @@ void HomePage::PreviewLoop() {
     auto* camera = Board::GetInstance().GetCamera();
     auto next_frame = std::chrono::steady_clock::now();
     while (preview_running_.load()) {
-        if (view_.load() == HomePageView::kCamera && !preview_paused_.load() &&
-            camera != nullptr) {
+        if (view_.load() == HomePageView::kCamera && !preview_paused_.load() && camera != nullptr) {
             // Capture() forwards the frame to Display::SetPreviewImage(), which
             // routes it to the camera page while the camera page is visible.
             camera->Capture();
@@ -1090,6 +1307,8 @@ void HomePage::StopWorker() {
     preview_running_.store(false);
     playback_running_.store(false);
     recording_.store(false);
+    // Stop tapping the mic if a recording was interrupted by teardown.
+    Application::GetInstance().GetAudioService().EnableAudioCapture(false);
     if (io_thread_.joinable()) {
         {
             std::lock_guard<std::mutex> lock(worker_mutex_);

@@ -45,7 +45,10 @@ public:
 // task (JPEG encoding + SD card IO), never on the LVGL or main task.
 class VideoRecorder {
 public:
-    static std::shared_ptr<VideoRecorder> Start(uint16_t width, uint16_t height, uint8_t fps);
+    // When audio_sample_rate > 0 an additional PCM ("auds") stream is muxed in.
+    static std::shared_ptr<VideoRecorder> Start(uint16_t width, uint16_t height, uint8_t fps,
+                                                int audio_sample_rate = 0,
+                                                int audio_channels = 1, int audio_bits = 16);
     ~VideoRecorder();
 
     VideoRecorder(const VideoRecorder&) = delete;
@@ -53,6 +56,10 @@ public:
 
     // src must be tightly packed RGB565 (width * height * 2 bytes).
     bool AddFrame(uint8_t* src, size_t size, uint16_t width, uint16_t height);
+
+    // pcm is interleaved 16-bit little-endian samples at the audio sample rate
+    // passed to Start(). Returns false on error or when no audio stream exists.
+    bool AddAudio(const uint8_t* pcm, size_t bytes);
 
     // Patches the AVI headers, writes the idx1 index and closes the file.
     // Returns the file path, or empty when no frame was recorded.
@@ -64,13 +71,26 @@ private:
     struct IndexEntry {
         uint32_t offset;
         uint32_t length;
+        std::string fourcc;  // "00dc" video, "01wb" audio
     };
+
+    bool has_audio_ = false;
+    int audio_sample_rate_ = 0;
+    int audio_channels_ = 1;
+    int audio_bits_ = 0;
+    uint32_t audio_samples_ = 0;
 
     FILE* file_ = nullptr;
     std::string path_;
-    long movi_data_start_ = 0;
+    long movi_data_start_ = 0;  // also the header size; used by Finish()
     uint32_t frames_ = 0;
     std::vector<IndexEntry> index_;
+
+    // Patchable header offsets captured while writing the header.
+    long avih_total_frames_pos_ = 0;
+    long video_strh_length_pos_ = 0;
+    long audio_strh_length_pos_ = 0;
+    long movi_size_pos_ = 0;
 };
 
 // Minimal MJPEG-in-AVI reader. Open() parses the RIFF/LIST structure once,
@@ -86,16 +106,43 @@ public:
 
     // Returns nullptr at the end of the movi list or on a corrupt chunk.
     std::shared_ptr<LvglImage> NextFrame(int max_width, int max_height);
+
+    // Reads the next audio chunk ("01wb") as 16-bit PCM. Stops before the next
+    // video chunk (rewinding) so the video reader is never starved. Returns
+    // false when no audio stream exists or no audio chunk is available yet.
+    bool NextAudio(std::vector<int16_t>& out);
+
     void Rewind();
     uint32_t FrameIntervalUs() const { return frame_interval_us_; }
+    bool HasAudio() const { return audio_rate_ > 0; }
+
+    // Playback progress, used by the gallery UI to render a seek bar / timer.
+    // CurrentFrame() advances by one on every successfully decoded frame and
+    // resets on Rewind(); TotalFrames() is the count discovered while opening.
+    int TotalFrames() const { return total_frames_; }
+    int CurrentFrame() const { return current_frame_; }
+    int DurationMs() const {
+        return total_frames_ > 0
+                   ? total_frames_ * static_cast<int>(frame_interval_us_) / 1000
+                   : 0;
+    }
+    int PositionMs() const {
+        return current_frame_ * static_cast<int>(frame_interval_us_) / 1000;
+    }
 
 private:
+    void ScanFrameCount();
     VideoPlayer() = default;
 
     FILE* file_ = nullptr;
     long movi_data_start_ = 0;
     long movi_data_end_ = 0;
     uint32_t frame_interval_us_ = 100000;
+    int audio_rate_ = 0;
+    int audio_channels_ = 0;
+    int audio_bits_ = 0;
+    int total_frames_ = 0;
+    int current_frame_ = 0;
 };
 
 #endif  // PHOTO_STORAGE_H
