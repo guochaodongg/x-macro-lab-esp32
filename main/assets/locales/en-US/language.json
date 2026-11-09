@@ -60,6 +60,7 @@
         "HOME_HINT": "Choose a function",
         "HOME_CAMERA": "Camera",
         "HOME_AI_CHAT": "AI Chat",
+        "HOME_MUSIC": "Music",
         "HOME_BUTTON": "Home",
         "CAMERA_CAPTURE": "Capture",
         "CAMERA_RESUME": "Resume",
@@ -84,6 +85,12 @@
         "PHOTO_SAVING": "Saving...",
         "PHOTO_SAVED": "Photo saved to SD card",
         "PHOTO_SAVE_FAILED": "Save failed, check SD card",
-        "SD_CARD_UNAVAILABLE": "SD card not available"
+        "SD_CARD_UNAVAILABLE": "SD card not available",
+        "MUSIC_TITLE": "Music Player",
+        "MUSIC_LOADING": "Loading music...",
+        "MUSIC_EMPTY": "No MP3 files in music folder",
+        "MUSIC_FAILED": "Cannot play this track",
+        "MUSIC_PLAYING": "Playing",
+        "MUSIC_PAUSED": "Paused"
     }
 }

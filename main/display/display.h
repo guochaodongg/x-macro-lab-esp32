@@ -26,9 +26,10 @@ class LvglImage;
 // Which page is shown on top of the existing chat screen.
 enum class HomePageView {
     kAiChat,   // The original wake-word / chat screen
-    kHome,     // Launcher with the camera and AI chat entries
+    kHome,     // Launcher with the camera, music and AI chat entries
     kCamera,   // Camera live preview page
     kGallery,  // Photo gallery on the SD card
+    kMusic,    // MP3 music player on the SD card
 };
 
 class Theme {

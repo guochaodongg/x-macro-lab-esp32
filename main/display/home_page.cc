@@ -34,6 +34,10 @@ namespace {
 constexpr int kPreviewIntervalMs = 25;
 constexpr int kRecordingPreviewIntervalMs = 80;
 constexpr int kHintVisibleMs = 5000;
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+constexpr int kMaxMusicEntries = 24;
+constexpr int kMusicStatusIntervalMs = 250;
+#endif
 #if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
 constexpr int64_t kDeleteConfirmUs = 3000000;
 constexpr int kVideoFps = 10;
@@ -63,16 +67,7 @@ void SetObjectVisible(lv_obj_t* obj, bool visible) {
     }
 }
 
-#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
-bool IsVideoPath(const std::string& path) {
-    if (path.size() <= 4) {
-        return false;
-    }
-    const std::string suffix = path.substr(path.size() - 4);
-    return suffix == ".AVI" || suffix == ".avi";
-}
-
-void FormatTime(char* buf, size_t n, int ms) {
+[[maybe_unused]] void FormatTime(char* buf, size_t n, int ms) {
     if (ms < 0) {
         ms = 0;
     }
@@ -80,6 +75,15 @@ void FormatTime(char* buf, size_t n, int ms) {
     const int mm = total / 60;
     const int ss = total % 60;
     snprintf(buf, n, "%02d:%02d", mm, ss);
+}
+
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+bool IsVideoPath(const std::string& path) {
+    if (path.size() <= 4) {
+        return false;
+    }
+    const std::string suffix = path.substr(path.size() - 4);
+    return suffix == ".AVI" || suffix == ".avi";
 }
 
 // "VID_00000001.AVI" -> "V1", "IMG_00000012.JPG" -> "P12". Keeps just
@@ -215,6 +219,10 @@ std::shared_ptr<CapturedFrame> CopyRgb565Frame(const lv_img_dsc_t* dsc) {
 
 HomePage::HomePage(Display* display, int width, int height, LvglTheme* theme)
     : display_(display), width_(width), height_(height) {
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    music_player_ = std::make_unique<MusicPlayer>();
+    music_player_->Start();
+#endif
     CreateUi(theme);
 }
 
@@ -225,10 +233,22 @@ HomePage::~HomePage() {
         lv_timer_delete(hint_timer_);
         hint_timer_ = nullptr;
     }
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    if (music_timer_ != nullptr) {
+        lv_timer_delete(music_timer_);
+        music_timer_ = nullptr;
+    }
+    music_player_->Stop();
+#endif
     StopWorker();
     if (home_button_ != nullptr) {
         lv_obj_del(home_button_);
     }
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    if (music_root_ != nullptr) {
+        lv_obj_del(music_root_);
+    }
+#endif
     if (gallery_root_ != nullptr) {
         lv_obj_del(gallery_root_);
     }
@@ -318,6 +338,9 @@ void HomePage::CreateUi(LvglTheme* theme) {
     lv_obj_set_style_text_align(home_hint, LV_TEXT_ALIGN_CENTER, 0);
     camera_button_ =
         CreateButton(home_root_, Lang::Strings::HOME_CAMERA, entry_width, button_height);
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    music_button_ = CreateButton(home_root_, Lang::Strings::HOME_MUSIC, entry_width, button_height);
+#endif
     ai_button_ = CreateButton(home_root_, Lang::Strings::HOME_AI_CHAT, entry_width, button_height);
 
     camera_root_ = CreateRoot(screen, width_, height_, 0, false);
@@ -414,6 +437,89 @@ void HomePage::CreateUi(LvglTheme* theme) {
         },
         LV_EVENT_CLICKED, this);
 
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    const int music_list_width = width_ - 2 * margin;
+    const int music_list_top = margin + line_height * 2 + 8;
+    const int music_list_height = std::max(line_height * 3, height_ * 34 / 100);
+    const int music_entry_height = std::max(line_height + 4, 20);
+    const int music_progress_bottom = margin + icon_size + 8;
+    const int music_step =
+        std::min(icon_size + 4, std::max(icon_size / 2, (width_ - icon_size - 2 * margin) / 4));
+
+    music_root_ = CreateRoot(screen, width_, height_, 0, false);
+    auto* music_title = lv_label_create(music_root_);
+    lv_label_set_text(music_title, Lang::Strings::MUSIC_TITLE);
+    lv_obj_align(music_title, LV_ALIGN_TOP_MID, 0, margin);
+
+    music_back_button_ = CreateIconButton(music_root_, MATERIAL_SYMBOLS_ARROW_BACK, icon_size);
+    lv_obj_align(music_back_button_, LV_ALIGN_TOP_LEFT, margin, margin);
+
+    music_status_ = lv_label_create(music_root_);
+    lv_label_set_text(music_status_, Lang::Strings::MUSIC_LOADING);
+    lv_obj_set_width(music_status_, music_list_width);
+    lv_label_set_long_mode(music_status_, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(music_status_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(music_status_, LV_ALIGN_TOP_MID, 0, margin + line_height + 4);
+
+    music_list_ = lv_obj_create(music_root_);
+    lv_obj_set_size(music_list_, music_list_width, music_list_height);
+    lv_obj_align(music_list_, LV_ALIGN_TOP_MID, 0, music_list_top);
+    lv_obj_set_style_pad_all(music_list_, 2, 0);
+    lv_obj_set_style_pad_row(music_list_, 2, 0);
+    lv_obj_set_style_border_width(music_list_, 1, 0);
+    lv_obj_set_style_bg_opa(music_list_, LV_OPA_COVER, 0);
+    lv_obj_set_flex_flow(music_list_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(music_list_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scrollbar_mode(music_list_, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_scroll_dir(music_list_, LV_DIR_VER);
+
+    // Reuse a fixed pool of rows instead of creating LVGL objects on every
+    // directory scan. Each row keeps its index in a stable user-data struct.
+    for (int i = 0; i < kMaxMusicEntries; ++i) {
+        auto* button = CreateButton(music_list_, "", music_list_width - 8, music_entry_height);
+        auto* label = lv_obj_get_child(button, 0);
+        lv_obj_set_width(label, music_list_width - 16);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, 2, 0);
+        auto data = std::make_unique<MusicEntryData>(MusicEntryData{this, i});
+        lv_obj_add_event_cb(
+            button,
+            [](lv_event_t* e) {
+                auto* entry = static_cast<MusicEntryData*>(lv_event_get_user_data(e));
+                entry->page->SelectMusic(entry->index);
+            },
+            LV_EVENT_CLICKED, data.get());
+        music_entries_.push_back(button);
+        music_entry_labels_.push_back(label);
+        music_entry_data_.push_back(std::move(data));
+        SetObjectVisible(button, false);
+    }
+
+    music_progress_bar_ = lv_bar_create(music_root_);
+    lv_obj_set_size(music_progress_bar_, width_ * 60 / 100, 5);
+    lv_obj_align(music_progress_bar_, LV_ALIGN_BOTTOM_MID, 0, -music_progress_bottom);
+    lv_bar_set_range(music_progress_bar_, 0, 1000);
+    lv_bar_set_value(music_progress_bar_, 0, LV_ANIM_OFF);
+
+    music_progress_label_ = lv_label_create(music_root_);
+    lv_label_set_text(music_progress_label_, "00:00 / 00:00");
+    lv_obj_align_to(music_progress_label_, music_progress_bar_, LV_ALIGN_OUT_TOP_MID, 0, -2);
+
+    music_vol_down_button_ = CreateIconButton(music_root_, MATERIAL_SYMBOLS_VOLUME_DOWN, icon_size);
+    lv_obj_align(music_vol_down_button_, LV_ALIGN_BOTTOM_MID, -2 * music_step, -margin);
+    music_prev_button_ = CreateIconButton(music_root_, MATERIAL_SYMBOLS_SKIP_PREVIOUS, icon_size);
+    lv_obj_align(music_prev_button_, LV_ALIGN_BOTTOM_MID, -music_step, -margin);
+    music_play_button_ = CreateIconButton(music_root_, MATERIAL_SYMBOLS_PAUSE, icon_size);
+    lv_obj_align(music_play_button_, LV_ALIGN_BOTTOM_MID, 0, -margin);
+    music_play_label_ = lv_obj_get_child(music_play_button_, 0);
+    music_next_button_ = CreateIconButton(music_root_, MATERIAL_SYMBOLS_SKIP_NEXT, icon_size);
+    lv_obj_align(music_next_button_, LV_ALIGN_BOTTOM_MID, music_step, -margin);
+    music_vol_up_button_ = CreateIconButton(music_root_, MATERIAL_SYMBOLS_VOLUME_UP, icon_size);
+    lv_obj_align(music_vol_up_button_, LV_ALIGN_BOTTOM_MID, 2 * music_step, -margin);
+#endif
+
     // Small floating entry back to the launcher, only visible on the chat screen.
     home_button_ = CreateIconButton(screen, MATERIAL_SYMBOLS_HOME, icon_size);
     lv_obj_align(home_button_, LV_ALIGN_LEFT_MID, margin, 0);
@@ -432,6 +538,52 @@ void HomePage::CreateUi(LvglTheme* theme) {
                 ->RequestView(HomePageView::kAiChat, true);
         },
         LV_EVENT_CLICKED, this);
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    lv_obj_add_event_cb(
+        music_button_,
+        [](lv_event_t* e) {
+            static_cast<HomePage*>(lv_event_get_user_data(e))
+                ->RequestView(HomePageView::kMusic, false);
+        },
+        LV_EVENT_CLICKED, this);
+    lv_obj_add_event_cb(
+        music_back_button_,
+        [](lv_event_t* e) {
+            static_cast<HomePage*>(lv_event_get_user_data(e))
+                ->RequestView(HomePageView::kHome, false);
+        },
+        LV_EVENT_CLICKED, this);
+    lv_obj_add_event_cb(
+        music_play_button_,
+        [](lv_event_t* e) {
+            static_cast<HomePage*>(lv_event_get_user_data(e))->music_player_->TogglePause();
+        },
+        LV_EVENT_CLICKED, this);
+    lv_obj_add_event_cb(
+        music_prev_button_,
+        [](lv_event_t* e) {
+            static_cast<HomePage*>(lv_event_get_user_data(e))->music_player_->Previous();
+        },
+        LV_EVENT_CLICKED, this);
+    lv_obj_add_event_cb(
+        music_next_button_,
+        [](lv_event_t* e) {
+            static_cast<HomePage*>(lv_event_get_user_data(e))->music_player_->Next();
+        },
+        LV_EVENT_CLICKED, this);
+    lv_obj_add_event_cb(
+        music_vol_up_button_,
+        [](lv_event_t* e) {
+            static_cast<HomePage*>(lv_event_get_user_data(e))->ChangePlaybackVolume(10);
+        },
+        LV_EVENT_CLICKED, this);
+    lv_obj_add_event_cb(
+        music_vol_down_button_,
+        [](lv_event_t* e) {
+            static_cast<HomePage*>(lv_event_get_user_data(e))->ChangePlaybackVolume(-10);
+        },
+        LV_EVENT_CLICKED, this);
+#endif
     lv_obj_add_event_cb(
         back_button_,
         [](lv_event_t* e) {
@@ -515,9 +667,23 @@ void HomePage::CreateUi(LvglTheme* theme) {
         },
         kHintVisibleMs, this);
     lv_timer_pause(hint_timer_);
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    music_timer_ = lv_timer_create(
+        [](lv_timer_t* timer) {
+            auto* page = static_cast<HomePage*>(lv_timer_get_user_data(timer));
+            if (page->view_.load() == HomePageView::kMusic) {
+                page->UpdateMusicUi();
+            }
+        },
+        kMusicStatusIntervalMs, this);
+    lv_timer_pause(music_timer_);
+#endif
 
     // Created after SetupUI(), so these roots are already above the chat UI.
     SetObjectVisible(home_root_, false);
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    SetObjectVisible(music_root_, false);
+#endif
     SetObjectVisible(camera_root_, false);
     SetObjectVisible(gallery_root_, false);
     SetObjectVisible(home_button_, false);
@@ -569,6 +735,36 @@ void HomePage::ApplyTheme(LvglTheme* theme) {
         lv_obj_set_style_bg_color(label, theme->background_color(), 0);
         lv_obj_set_style_text_color(label, theme->text_color(), 0);
     }
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    if (music_root_ != nullptr) {
+        lv_obj_set_style_bg_color(music_root_, theme->background_color(), 0);
+        lv_obj_set_style_text_color(music_root_, theme->text_color(), 0);
+    }
+    if (music_list_ != nullptr) {
+        lv_obj_set_style_bg_color(music_list_, theme->background_color(), 0);
+        lv_obj_set_style_border_color(music_list_, theme->border_color(), 0);
+    }
+    for (auto* button : {music_button_, music_back_button_, music_play_button_, music_prev_button_,
+                         music_next_button_, music_vol_up_button_, music_vol_down_button_}) {
+        if (button == nullptr) {
+            continue;
+        }
+        lv_obj_set_style_bg_color(button, theme->chat_background_color(), 0);
+        lv_obj_set_style_border_color(button, theme->border_color(), 0);
+        lv_obj_set_style_text_color(button, theme->text_color(), 0);
+    }
+    music_entry_bg_ = theme->chat_background_color();
+    for (auto* entry : music_entries_) {
+        lv_obj_set_style_bg_color(entry, music_entry_bg_, 0);
+        lv_obj_set_style_border_color(entry, theme->border_color(), 0);
+        lv_obj_set_style_text_color(entry, theme->text_color(), 0);
+    }
+    for (auto* label : {music_status_, music_progress_label_}) {
+        if (label != nullptr) {
+            lv_obj_set_style_text_color(label, theme->text_color(), 0);
+        }
+    }
+#endif
     if (theme->icon_font() != nullptr && theme->icon_font()->font() != nullptr) {
         auto* icon_font = theme->icon_font()->font();
         for (auto* label : icon_labels_) {
@@ -643,13 +839,19 @@ bool HomePage::IsCameraPageVisible() const { return view_.load() == HomePageView
 
 bool HomePage::IsOverlayVisible() const {
     const auto view = view_.load();
-    return view == HomePageView::kCamera || view == HomePageView::kGallery;
+    return view == HomePageView::kCamera || view == HomePageView::kGallery ||
+           view == HomePageView::kMusic;
 }
 
 void HomePage::SetView(HomePageView view) {
     view_.store(view);
     CancelDelete();
     StopPlayback();
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    // Music is tied to its page, just like gallery video playback.
+    music_player_->StopPlayback();
+    lv_timer_pause(music_timer_);
+#endif
     auto* camera = Board::GetInstance().GetCamera();
     if (camera != nullptr) {
         camera->SetRealtimePreview(view == HomePageView::kCamera);
@@ -663,6 +865,9 @@ void HomePage::SetView(HomePageView view) {
     SetObjectVisible(camera_root_, view == HomePageView::kCamera);
     SetObjectVisible(gallery_root_, view == HomePageView::kGallery);
     SetObjectVisible(home_button_, view == HomePageView::kAiChat);
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    SetObjectVisible(music_root_, view == HomePageView::kMusic);
+#endif
 
     if (view != HomePageView::kCamera) {
         // Keep the last frame alive: the hidden lv_image still references its
@@ -681,6 +886,16 @@ void HomePage::SetView(HomePageView view) {
     if (view == HomePageView::kGallery) {
         LoadGallery();
     }
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    if (view == HomePageView::kMusic) {
+        music_paths_.clear();
+        music_current_index_ = -2;
+        music_player_->LoadPlaylist(true);
+        lv_timer_reset(music_timer_);
+        lv_timer_resume(music_timer_);
+        UpdateMusicUi();
+    }
+#endif
 }
 
 void HomePage::SetCameraHint(const char* text) {
@@ -975,7 +1190,7 @@ void HomePage::SetPlayIcon(const char* icon) {
 }
 
 void HomePage::ChangePlaybackVolume(int delta) {
-#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY || CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
     auto* codec = Board::GetInstance().GetAudioCodec();
     if (codec == nullptr) {
         return;
@@ -1334,3 +1549,85 @@ void HomePage::StopWorker() {
 #endif
     pending_video_frames_.store(0);
 }
+
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+void HomePage::SetMusicPlayIcon(const char* icon) {
+    if (music_play_label_ != nullptr) {
+        lv_label_set_text(music_play_label_, icon);
+    }
+}
+
+void HomePage::SelectMusic(int index) { music_player_->Play(index); }
+
+void HomePage::RefreshMusicList(int current_index) {
+    for (size_t i = 0; i < music_entries_.size(); ++i) {
+        auto* button = music_entries_[i];
+        if (i >= music_paths_.size()) {
+            SetObjectVisible(button, false);
+            continue;
+        }
+        SetObjectVisible(button, true);
+        const std::string& path = music_paths_[i];
+        const char* slash = strrchr(path.c_str(), '/');
+        std::string name = slash == nullptr ? path : slash + 1;
+        const size_t dot = name.rfind('.');
+        if (dot != std::string::npos) {
+            name.resize(dot);
+        }
+        char text[128];
+        snprintf(text, sizeof(text), "%s%s", static_cast<int>(i) == current_index ? "> " : "  ",
+                 name.c_str());
+        lv_label_set_text(music_entry_labels_[i], text);
+        lv_obj_set_style_bg_color(
+            button, static_cast<int>(i) == current_index ? lv_color_hex(0x2A5C9A) : music_entry_bg_,
+            0);
+    }
+}
+
+void HomePage::UpdateMusicUi() {
+    const auto status = music_player_->GetStatus();
+    auto paths = music_player_->GetPlaylist();
+    if (paths != music_paths_) {
+        music_paths_ = std::move(paths);
+        music_current_index_ = -2;
+    }
+    if (status.index != music_current_index_) {
+        music_current_index_ = status.index;
+        RefreshMusicList(status.index);
+    }
+
+    char state[64];
+    if (status.loading) {
+        snprintf(state, sizeof(state), "%s", Lang::Strings::MUSIC_LOADING);
+    } else if (!status.available) {
+        snprintf(state, sizeof(state), "%s", Lang::Strings::SD_CARD_UNAVAILABLE);
+    } else if (status.total == 0) {
+        snprintf(state, sizeof(state), "%s", Lang::Strings::MUSIC_EMPTY);
+    } else if (status.failed) {
+        snprintf(state, sizeof(state), "%s", Lang::Strings::MUSIC_FAILED);
+    } else if (status.index >= 0) {
+        snprintf(state, sizeof(state), "%s %d/%d",
+                 status.paused ? Lang::Strings::MUSIC_PAUSED : Lang::Strings::MUSIC_PLAYING,
+                 status.index + 1, status.total);
+    } else {
+        snprintf(state, sizeof(state), "%s", Lang::Strings::MUSIC_TITLE);
+    }
+    lv_label_set_text(music_status_, state);
+
+    int percent = 0;
+    if (status.duration_ms > 0) {
+        percent =
+            static_cast<int>(static_cast<int64_t>(status.position_ms) * 1000 / status.duration_ms);
+        percent = std::clamp(percent, 0, 1000);
+    }
+    lv_bar_set_value(music_progress_bar_, percent, LV_ANIM_OFF);
+    char pos[16];
+    char dur[16];
+    FormatTime(pos, sizeof(pos), status.position_ms);
+    FormatTime(dur, sizeof(dur), status.duration_ms);
+    char progress[40];
+    snprintf(progress, sizeof(progress), "%s / %s", pos, dur);
+    lv_label_set_text(music_progress_label_, progress);
+    SetMusicPlayIcon(status.paused ? MATERIAL_SYMBOLS_PLAY_ARROW : MATERIAL_SYMBOLS_PAUSE);
+}
+#endif

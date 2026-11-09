@@ -3,35 +3,21 @@
 #include "image_to_jpeg.h"
 #include "jpeg_to_image.h"
 #include "lvgl_image.h"
+#include "sdcard_mount.h"
 
-#include <esp_err.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 
+#include <dirent.h>
+#include <sys/stat.h>
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dirent.h>
 #include <functional>
-#include <sys/stat.h>
 
 #include "sdkconfig.h"
-
-#if CONFIG_XIAOZHI_ENABLE_SDCARD
-#include <driver/gpio.h>
-#include <driver/sdmmc_host.h>
-#include <driver/sdmmc_types.h>
-#include <driver/spi_common.h>
-#include <esp_vfs_fat.h>
-#if CONFIG_XIAOZHI_SDCARD_MODE_SDMMC_1BIT
-#include <driver/sdmmc_default_configs.h>
-#else
-#include <driver/sdspi_host.h>
-#include <driver/spi_master.h>
-#endif
-#endif
 
 #define TAG "PhotoStorage"
 
@@ -69,8 +55,7 @@ bool MkdirRecursive(const std::string& path) {
             continue;
         }
         if (mkdir(parent.c_str(), 0777) != 0) {
-            ESP_LOGE(TAG, "mkdir %s failed: errno=%d (%s)", parent.c_str(), errno,
-                     strerror(errno));
+            ESP_LOGE(TAG, "mkdir %s failed: errno=%d (%s)", parent.c_str(), errno, strerror(errno));
             return false;
         }
     }
@@ -84,100 +69,10 @@ bool MkdirRecursive(const std::string& path) {
     return true;
 }
 
-#if CONFIG_XIAOZHI_ENABLE_SDCARD
-bool MountSdCard() {
-    static bool mounted = false;
-    if (mounted) {
-        return true;
-    }
-    const char* mount_point = CONFIG_XIAOZHI_SDCARD_MOUNT_POINT;
-    struct stat st;
-    if (stat(mount_point, &st) == 0 && S_ISDIR(st.st_mode)) {
-        // The board already mounted this path (e.g. ESP32-P4-Function-EV-Board).
-        mounted = true;
-        return true;
-    }
-
-    esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {};
-    mount_cfg.format_if_mount_failed = false;
-    mount_cfg.max_files = 5;
-    mount_cfg.allocation_unit_size = 16 * 1024;
-    sdmmc_card_t* card = nullptr;
-    esp_err_t err;
-
-#if CONFIG_XIAOZHI_SDCARD_MODE_SDMMC_1BIT
-    const int clk = CONFIG_XIAOZHI_SDMMC_CLK_GPIO;
-    const int cmd = CONFIG_XIAOZHI_SDMMC_CMD_GPIO;
-    const int d0 = CONFIG_XIAOZHI_SDMMC_D0_GPIO;
-    if (clk < 0 || cmd < 0 || d0 < 0) {
-        ESP_LOGE(TAG, "SDMMC GPIOs are not configured");
-        return false;
-    }
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
-    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.clk = static_cast<gpio_num_t>(clk);
-    slot.cmd = static_cast<gpio_num_t>(cmd);
-    slot.d0 = static_cast<gpio_num_t>(d0);
-    slot.cd = SDMMC_SLOT_NO_CD;
-    slot.wp = SDMMC_SLOT_NO_WP;
-    slot.width = 1;
-    ESP_LOGI(TAG, "Mounting SDMMC 1-bit: CLK=%d CMD=%d DAT0=%d", clk, cmd, d0);
-    err = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot, &mount_cfg, &card);
-#else
-    const int clk = CONFIG_XIAOZHI_SDCARD_PIN_CLK;
-    const int mosi = CONFIG_XIAOZHI_SDCARD_PIN_MOSI;
-    const int miso = CONFIG_XIAOZHI_SDCARD_PIN_MISO;
-    const int cs = CONFIG_XIAOZHI_SDCARD_PIN_CS;
-    if (clk < 0 || mosi < 0 || miso < 0 || cs < 0) {
-        ESP_LOGE(TAG, "SDSPI GPIOs are not configured");
-        return false;
-    }
-
-#if CONFIG_XIAOZHI_SDCARD_SPI_HOST == 3
-    const spi_host_device_t host_id = SPI3_HOST;
-#else
-    const spi_host_device_t host_id = SPI2_HOST;
-#endif
-    spi_bus_config_t bus_cfg = {};
-    bus_cfg.mosi_io_num = mosi;
-    bus_cfg.miso_io_num = miso;
-    bus_cfg.sclk_io_num = clk;
-    bus_cfg.quadwp_io_num = -1;
-    bus_cfg.quadhd_io_num = -1;
-    bus_cfg.max_transfer_sz = 4000;
-    err = spi_bus_initialize(host_id, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    sdmmc_host_t sdspi_host = SDSPI_HOST_DEFAULT();
-    sdspi_host.slot = host_id;
-    sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot.host_id = host_id;
-    slot.gpio_cs = static_cast<gpio_num_t>(cs);
-    slot.gpio_cd = SDSPI_SLOT_NO_CD;
-    slot.gpio_wp = GPIO_NUM_NC;
-    slot.gpio_int = GPIO_NUM_NC;
-    err = esp_vfs_fat_sdspi_mount(mount_point, &sdspi_host, &slot, &mount_cfg, &card);
-#endif
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SD card mount failed: %s", esp_err_to_name(err));
-        return false;
-    }
-    ESP_LOGI(TAG, "SD card mounted at %s", mount_point);
-    mounted = true;
-    return true;
-}
-#endif
-
 bool EnsureMounted() {
-#if CONFIG_XIAOZHI_ENABLE_SDCARD
-    if (!MountSdCard()) {
+    if (!EnsureSdCardMounted()) {
         return false;
     }
-#endif
     if (!MkdirRecursive(PhotoDir())) {
         ESP_LOGW(TAG, "Photo directory %s is not usable (write protection or FAT format?)",
                  PhotoDir().c_str());
@@ -268,8 +163,7 @@ std::vector<std::string> PhotoStorage::ListMedia() {
 
 bool PhotoStorage::DeleteMedia(const std::string& path) {
     const std::string dir = PhotoDir() + "/";
-    if (path.compare(0, dir.size(), dir) != 0 ||
-        path.find('/', dir.size()) != std::string::npos) {
+    if (path.compare(0, dir.size(), dir) != 0 || path.find('/', dir.size()) != std::string::npos) {
         ESP_LOGE(TAG, "Refusing to delete %s", path.c_str());
         return false;
     }
@@ -322,8 +216,8 @@ std::shared_ptr<LvglImage> PhotoStorage::LoadPhoto(const std::string& path, int 
     return image;
 }
 
-std::shared_ptr<LvglImage> PhotoStorage::DecodeJpeg(const uint8_t* data, size_t len,
-                                                    int max_width, int max_height) {
+std::shared_ptr<LvglImage> PhotoStorage::DecodeJpeg(const uint8_t* data, size_t len, int max_width,
+                                                    int max_height) {
     if (data == nullptr || len == 0) {
         return nullptr;
     }
@@ -332,8 +226,8 @@ std::shared_ptr<LvglImage> PhotoStorage::DecodeJpeg(const uint8_t* data, size_t 
     size_t width = 0;
     size_t height = 0;
     size_t stride = 0;
-    esp_err_t ret = jpeg_to_image_fit(data, len, max_width, max_height, &pixels, &out_len,
-                                      &width, &height, &stride);
+    esp_err_t ret = jpeg_to_image_fit(data, len, max_width, max_height, &pixels, &out_len, &width,
+                                      &height, &stride);
     if (ret != ESP_OK || pixels == nullptr) {
         if (pixels != nullptr) {
             heap_caps_free(pixels);
@@ -349,15 +243,13 @@ namespace {
 constexpr uint8_t kVideoJpegQuality = 70;
 
 void WriteU16(FILE* file, uint16_t value) {
-    const uint8_t bytes[2] = {static_cast<uint8_t>(value),
-                              static_cast<uint8_t>(value >> 8)};
+    const uint8_t bytes[2] = {static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8)};
     fwrite(bytes, 1, sizeof(bytes), file);
 }
 
 void WriteU32(FILE* file, uint32_t value) {
-    const uint8_t bytes[4] = {
-        static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8),
-        static_cast<uint8_t>(value >> 16), static_cast<uint8_t>(value >> 24)};
+    const uint8_t bytes[4] = {static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8),
+                              static_cast<uint8_t>(value >> 16), static_cast<uint8_t>(value >> 24)};
     fwrite(bytes, 1, sizeof(bytes), file);
 }
 
@@ -422,7 +314,7 @@ std::shared_ptr<VideoRecorder> VideoRecorder::Start(uint16_t width, uint16_t hei
     WriteU32(file, 0);
     WriteU32(file, 0x10);  // AVIF_HASINDEX
     recorder->avih_total_frames_pos_ = ftell(file);
-    WriteU32(file, 0);     // dwTotalFrames (patched)
+    WriteU32(file, 0);  // dwTotalFrames (patched)
     WriteU32(file, 0);
     WriteU32(file, has_audio ? 2 : 1);  // dwStreams
     WriteU32(file, static_cast<uint32_t>(width) * height * 2);
@@ -440,15 +332,15 @@ std::shared_ptr<VideoRecorder> VideoRecorder::Start(uint16_t width, uint16_t hei
     WriteU32(file, 56);
     WriteFourCC(file, "vids");
     WriteFourCC(file, "MJPG");
-    WriteU32(file, 0);  // dwFlags
-    WriteU16(file, 0);  // wPriority
-    WriteU16(file, 0);  // wLanguage
-    WriteU32(file, 0);  // dwInitialFrames
-    WriteU32(file, 1);  // dwScale
+    WriteU32(file, 0);    // dwFlags
+    WriteU16(file, 0);    // wPriority
+    WriteU16(file, 0);    // wLanguage
+    WriteU32(file, 0);    // dwInitialFrames
+    WriteU32(file, 1);    // dwScale
     WriteU32(file, fps);  // dwRate
     WriteU32(file, 0);    // dwStart
     recorder->video_strh_length_pos_ = ftell(file);
-    WriteU32(file, 0);    // dwLength (patched)
+    WriteU32(file, 0);  // dwLength (patched)
     WriteU32(file, static_cast<uint32_t>(width) * height * 2);
     WriteU32(file, 0xFFFFFFFFU);  // dwQuality
     WriteU32(file, 0);            // dwSampleSize
@@ -462,8 +354,8 @@ std::shared_ptr<VideoRecorder> VideoRecorder::Start(uint16_t width, uint16_t hei
     WriteU32(file, 40);  // BITMAPINFOHEADER.biSize
     WriteU32(file, width);
     WriteU32(file, height);
-    WriteU16(file, 1);   // biPlanes
-    WriteU16(file, 24);  // biBitCount
+    WriteU16(file, 1);          // biPlanes
+    WriteU16(file, 24);         // biBitCount
     WriteFourCC(file, "MJPG");  // biCompression
     WriteU32(file, static_cast<uint32_t>(width) * height * 3);
     for (int i = 0; i < 4; ++i) {
@@ -480,18 +372,18 @@ std::shared_ptr<VideoRecorder> VideoRecorder::Start(uint16_t width, uint16_t hei
         WriteFourCC(file, "strh");
         WriteU32(file, 56);
         WriteFourCC(file, "auds");
-        WriteU32(file, 0);  // fccHandler (unused for PCM)
-        WriteU32(file, 0);  // dwFlags
-        WriteU16(file, 0);  // wPriority
-        WriteU16(file, 0);  // wLanguage
-        WriteU32(file, 0);  // dwInitialFrames
+        WriteU32(file, 0);                                   // fccHandler (unused for PCM)
+        WriteU32(file, 0);                                   // dwFlags
+        WriteU16(file, 0);                                   // wPriority
+        WriteU16(file, 0);                                   // wLanguage
+        WriteU32(file, 0);                                   // dwInitialFrames
         WriteU32(file, static_cast<uint32_t>(block_align));  // dwScale (bytes/frame)
-        WriteU32(file, avg_bytes);  // dwRate (bytes/sec)
-        WriteU32(file, 0);  // dwStart
+        WriteU32(file, avg_bytes);                           // dwRate (bytes/sec)
+        WriteU32(file, 0);                                   // dwStart
         recorder->audio_strh_length_pos_ = ftell(file);
-        WriteU32(file, 0);  // dwLength (audio samples, patched)
+        WriteU32(file, 0);                                   // dwLength (audio samples, patched)
         WriteU32(file, static_cast<uint32_t>(block_align));  // dwSuggestedBufferSize
-        WriteU32(file, 0);  // dwQuality
+        WriteU32(file, 0);                                   // dwQuality
         WriteU32(file, static_cast<uint32_t>(block_align));  // dwSampleSize (block align)
         WriteU16(file, 0);
         WriteU16(file, 0);
@@ -531,8 +423,8 @@ bool VideoRecorder::AddFrame(uint8_t* src, size_t size, uint16_t width, uint16_t
     }
     uint8_t* jpeg = nullptr;
     size_t jpeg_len = 0;
-    if (!image_to_jpeg(src, size, width, height, V4L2_PIX_FMT_RGB565, kVideoJpegQuality,
-                       &jpeg, &jpeg_len) ||
+    if (!image_to_jpeg(src, size, width, height, V4L2_PIX_FMT_RGB565, kVideoJpegQuality, &jpeg,
+                       &jpeg_len) ||
         jpeg == nullptr || jpeg_len == 0) {
         free(jpeg);
         return false;
@@ -584,8 +476,7 @@ std::string VideoRecorder::Finish() {
     if (file_ == nullptr) {
         return {};
     }
-    const uint32_t movi_data_len =
-        static_cast<uint32_t>(ftell(file_) - movi_data_start_);
+    const uint32_t movi_data_len = static_cast<uint32_t>(ftell(file_) - movi_data_start_);
     const uint32_t index_bytes = static_cast<uint32_t>(index_.size()) * 16;
     // riff_size excludes the 8-byte RIFF header, so it is header + movi + idx1.
     const uint32_t riff_size =
@@ -746,8 +637,8 @@ std::shared_ptr<VideoPlayer> VideoPlayer::Open(const std::string& path) {
                                     ReadU16(file);  // wFormatTag
                                     audio_channels = ReadU16(file);
                                     audio_rate = static_cast<int>(ReadU32(file));
-                                    ReadU32(file);  // nAvgBytesPerSec
-                                    ReadU16(file);  // nBlockAlign
+                                    ReadU32(file);               // nAvgBytesPerSec
+                                    ReadU16(file);               // nBlockAlign
                                     audio_bits = ReadU16(file);  // wBitsPerSample
                                     audio_stream_found = false;
                                 }
@@ -847,8 +738,8 @@ std::shared_ptr<LvglImage> VideoPlayer::NextFrame(int max_width, int max_height)
             fseek(file_, next, SEEK_SET);
             continue;
         }
-        auto* jpeg = static_cast<uint8_t*>(
-            heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        auto* jpeg =
+            static_cast<uint8_t*>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (jpeg == nullptr) {
             return nullptr;
         }

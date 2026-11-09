@@ -980,16 +980,37 @@ choice DISPLAY_STYLE
 endchoice
 
 config XIAOZHI_ENABLE_HOME_PAGE
-    bool "Enable home page with Camera and AI Chat entries"
+    bool "Enable home page with Camera, Music and AI Chat entries"
     depends on !USE_EMOTE_MESSAGE_STYLE
     default y
     help
-        Show a launcher with two entries when the device first becomes idle:
-        a camera page with a local live preview and capture, and the original
-        wake-word AI chat screen. Voice activity automatically returns to the
-        chat screen, and a small floating button brings the launcher back.
-        Boards without a camera keep the entry but report that no camera is
-        available. No-display, OLED and emote boards are unaffected.
+        Show a launcher when the device first becomes idle: a camera page with a
+        local live preview and capture, a music page that plays MP3 files from
+        the SD card, and the original wake-word AI chat screen. Voice activity
+        automatically returns to the chat screen, and a small floating button
+        brings the launcher back. Boards without a camera or SD card keep the
+        entries but report that the hardware is unavailable. No-display, OLED
+        and emote boards are unaffected.
+
+config XIAOZHI_ENABLE_MUSIC_PLAYER
+    bool "Play MP3 music from the SD card"
+    depends on XIAOZHI_ENABLE_HOME_PAGE
+    default y
+    help
+        Add a Music entry to the launcher. The page lists MP3 files found in
+        XIAOZHI_MUSIC_DIR and streams them through the speaker, with play /
+        pause, previous / next, volume and progress controls. Copy the MP3
+        files into that directory on the SD card before use. The MP3 decoder
+        is provided by the esp_audio_codec component.
+
+config XIAOZHI_MUSIC_DIR
+    string "Directory containing MP3 music files"
+    depends on XIAOZHI_ENABLE_MUSIC_PLAYER
+    default "/sdcard/music"
+    help
+        VFS path that holds the downloaded .mp3 files. It must be located under
+        the SD card mount point, either mounted by the board or by the generic
+        mount option below.
 
 config XIAOZHI_ENABLE_PHOTO_GALLERY
     bool "Save camera photos to SD card and browse them in a gallery"
@@ -1011,13 +1032,14 @@ config XIAOZHI_PHOTO_STORAGE_DIR
         under the SD card mount point.
 
 config XIAOZHI_ENABLE_SDCARD
-    bool "Mount the on-board SD/TF card for photos"
-    depends on XIAOZHI_ENABLE_PHOTO_GALLERY
+    bool "Mount the on-board SD/TF card for photos and music"
+    depends on XIAOZHI_ENABLE_PHOTO_GALLERY || XIAOZHI_ENABLE_MUSIC_PLAYER
     default n
     help
         Enable only if the board does not already mount /sdcard itself (for
         example ESP32-P4-Function-EV-Board and XingZhi ABS 2.0 do). Select the
-        interface and GPIOs below according to the board schematic.
+        interface and GPIOs below according to the board schematic. Both the
+        gallery and the music player share this mount.
 
 choice XIAOZHI_SDCARD_MODE
     prompt "SD card interface"
@@ -1042,6 +1064,8 @@ config XIAOZHI_SDCARD_MOUNT_POINT
     string "SD card mount point"
     depends on XIAOZHI_ENABLE_SDCARD
     default "/sdcard"
+    help
+        XIAOZHI_MUSIC_DIR and XIAOZHI_PHOTO_STORAGE_DIR must start with this path.
 
 config XIAOZHI_SDMMC_CLK_GPIO
     int "SDMMC CLK GPIO (-1 leaves the card unmounted)"

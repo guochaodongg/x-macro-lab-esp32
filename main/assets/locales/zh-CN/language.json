@@ -60,6 +60,7 @@
         "HOME_HINT": "请选择功能",
         "HOME_CAMERA": "相机",
         "HOME_AI_CHAT": "AI 对话",
+        "HOME_MUSIC": "播放音乐",
         "HOME_BUTTON": "主页",
         "CAMERA_CAPTURE": "拍照",
         "CAMERA_RESUME": "继续",
@@ -84,6 +85,12 @@
         "PHOTO_SAVING": "正在保存...",
         "PHOTO_SAVED": "照片已保存到 SD 卡",
         "PHOTO_SAVE_FAILED": "保存失败，请检查 SD 卡",
-        "SD_CARD_UNAVAILABLE": "未检测到 SD 卡"
+        "SD_CARD_UNAVAILABLE": "未检测到 SD 卡",
+        "MUSIC_TITLE": "音乐播放",
+        "MUSIC_LOADING": "正在加载音乐...",
+        "MUSIC_EMPTY": "music 目录中没有 MP3 文件",
+        "MUSIC_FAILED": "无法播放该曲目",
+        "MUSIC_PLAYING": "正在播放",
+        "MUSIC_PAUSED": "已暂停"
     }
 }

@@ -3,6 +3,7 @@
 
 #include "display.h"
 #include "lvgl_theme.h"
+#include "music_player.h"
 
 #include <lvgl.h>
 
@@ -17,13 +18,15 @@
 #include <thread>
 #include <vector>
 
+#include "sdkconfig.h"
+
 class LvglImage;
 class VideoRecorder;
 
-// Launcher drawn on top of the existing chat screen. It has two entries: a
-// camera page with a local live preview / photo / video capture, and the
-// original wake-word / AI chat screen. The camera page also hosts an SD card
-// gallery.
+// Launcher drawn on top of the existing chat screen. It has three entries: a
+// camera page with a local live preview / photo / video capture, an SD card
+// MP3 music player, and the original wake-word / AI chat screen. The camera
+// page also hosts an SD card gallery.
 // LVGL object access must happen with the display lock held, except for
 // StopWorker(), which joins the background task and must run without it.
 class HomePage {
@@ -86,6 +89,18 @@ private:
     void StopRecording();
     void SetVideoIcon(const char* icon);
 
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    struct MusicEntryData {
+        HomePage* page;
+        int index;
+    };
+
+    void UpdateMusicUi();
+    void RefreshMusicList(int current_index);
+    void SelectMusic(int index);
+    void SetMusicPlayIcon(const char* icon);
+#endif
+
     Display* display_;
     std::vector<lv_obj_t*> icon_labels_;
     int width_;
@@ -96,6 +111,7 @@ private:
     lv_obj_t* home_root_ = nullptr;
     lv_obj_t* camera_button_ = nullptr;
     lv_obj_t* ai_button_ = nullptr;
+    lv_obj_t* music_button_ = nullptr;
     lv_obj_t* home_button_ = nullptr;
 
     lv_obj_t* camera_root_ = nullptr;
@@ -125,6 +141,29 @@ private:
     lv_obj_t* gallery_vol_down_button_ = nullptr;
     lv_obj_t* gallery_progress_bar_ = nullptr;
     lv_obj_t* gallery_progress_label_ = nullptr;
+
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    lv_obj_t* music_root_ = nullptr;
+    lv_obj_t* music_back_button_ = nullptr;
+    lv_obj_t* music_status_ = nullptr;
+    lv_obj_t* music_list_ = nullptr;
+    lv_obj_t* music_progress_bar_ = nullptr;
+    lv_obj_t* music_progress_label_ = nullptr;
+    lv_obj_t* music_play_button_ = nullptr;
+    lv_obj_t* music_play_label_ = nullptr;
+    lv_obj_t* music_prev_button_ = nullptr;
+    lv_obj_t* music_next_button_ = nullptr;
+    lv_obj_t* music_vol_up_button_ = nullptr;
+    lv_obj_t* music_vol_down_button_ = nullptr;
+    lv_timer_t* music_timer_ = nullptr;
+    lv_color_t music_entry_bg_ = {};
+    std::vector<lv_obj_t*> music_entries_;
+    std::vector<lv_obj_t*> music_entry_labels_;
+    std::vector<std::unique_ptr<MusicEntryData>> music_entry_data_;
+    std::vector<std::string> music_paths_;
+    int music_current_index_ = -2;
+    std::unique_ptr<MusicPlayer> music_player_;
+#endif
 
     std::atomic<HomePageView> view_{HomePageView::kAiChat};
     std::unique_ptr<LvglImage> camera_frame_;
