@@ -57,11 +57,38 @@ private:
         lv_obj_t* image = nullptr;
     };
 
+    // One glass tile of the launcher grid. Colors are 0xRRGGBB.
+    struct LauncherAppDef {
+        const char* name;
+        const char* icon;
+        bool enabled;
+        HomePageView view;
+        bool wake;
+        uint32_t icon_color;
+        uint32_t dot_color;
+    };
+
+    // One horizontally swiped launcher page: a header, a 3x2 tile grid and a
+    // pair of corner glows tinted with the page accent.
+    struct LauncherPageDef {
+        const char* title;
+        const char* label;
+        uint32_t accent;
+        uint32_t glow_a;
+        uint32_t glow_b;
+        std::vector<LauncherAppDef> apps;
+    };
+
     void CreateUi(LvglTheme* theme);
+    void CreateLauncher(LvglTheme* theme);
+    void CreateLauncherPage(const LauncherPageDef& page, int index, LvglTheme* theme);
+    void UpdateStatusBarClock();
     ImageBox CreateImageBox(lv_obj_t* parent, int width, int height);
     lv_obj_t* CreateButton(lv_obj_t* parent, const char* text, int width, int height);
     lv_obj_t* CreateIconButton(lv_obj_t* parent, const char* icon, int size);
     void RequestView(HomePageView view, bool wake_ai);
+    void OnHomeScroll(lv_event_t* e);
+    void UpdateHomePageIndicator(int page);
     void CapturePhoto();
     void SetCaptureIcon(const char* icon);
     void StartWorker();
@@ -109,10 +136,26 @@ private:
     int preview_height_ = 0;
 
     lv_obj_t* home_root_ = nullptr;
-    lv_obj_t* camera_button_ = nullptr;
-    lv_obj_t* ai_button_ = nullptr;
-    lv_obj_t* music_button_ = nullptr;
+    lv_obj_t* home_statusbar_ = nullptr;
+    lv_obj_t* home_clock_ = nullptr;
+    lv_obj_t* home_battery_label_ = nullptr;
+    lv_obj_t* home_battery_pct_ = nullptr;
+    lv_obj_t* home_tileview_ = nullptr;
+    lv_obj_t* home_pager_ = nullptr;
+    lv_obj_t* home_page_label_ = nullptr;
+    lv_obj_t* home_pager_line_ = nullptr;
+    lv_obj_t* home_pager_track_ = nullptr;
     lv_obj_t* home_button_ = nullptr;
+    lv_timer_t* home_clock_timer_ = nullptr;
+    std::vector<lv_obj_t*> home_dots_;
+    std::vector<lv_obj_t*> home_app_icons_;
+    std::vector<std::string> home_page_titles_;
+    std::vector<lv_color_t> home_page_accents_;
+    int home_pages_count_ = 0;
+    std::vector<void*> home_click_data_;
+    // Where the gallery's back button returns to: the launcher when it was
+    // opened from the grid, the camera page when it was opened from there.
+    HomePageView gallery_back_view_ = HomePageView::kCamera;
 
     lv_obj_t* camera_root_ = nullptr;
     lv_obj_t* preview_box_ = nullptr;

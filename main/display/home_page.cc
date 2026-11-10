@@ -17,7 +17,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "sdkconfig.h"
 
@@ -27,7 +30,16 @@
 
 #define TAG "HomePage"
 
+// The launcher is a dense 320x240 design: the 20px theme font is too large for
+// its status bar, page header and icon captions, so it uses the 14px face.
+LV_FONT_DECLARE(font_noto_sans_basic_14_1);
+
 namespace {
+struct AppClickData {
+    HomePage* self;
+    HomePageView view;
+    bool wake;
+};
 // Capture() itself blocks on the sensor and the LVGL lock, so this is only a
 // ceiling on how often the preview task wakes up, not a fixed frame interval.
 // Recording gives the JPEG encoder / SD writer more room by previewing slower.
@@ -215,6 +227,25 @@ std::shared_ptr<CapturedFrame> CopyRgb565Frame(const lv_img_dsc_t* dsc) {
     return frame;
 }
 #endif
+
+// Launcher proportions, as a percentage of the display height. They follow the
+// 320x240 reference design: 22px status bar, 26px pager, the rest is the grid.
+constexpr int kLauncherStatusPercent = 9;
+constexpr int kLauncherPagerPercent = 11;
+constexpr int kLauncherHeadPercent = 14;
+constexpr int kLauncherClockIntervalMs = 5000;
+
+// Blend `rgb` toward `base`: 0 keeps base, 255 keeps rgb.
+lv_color_t TintColor(uint32_t rgb, uint32_t base, uint8_t amount) {
+    auto mix = [amount](uint32_t color, uint32_t back) {
+        return (color * static_cast<uint32_t>(amount) +
+                back * static_cast<uint32_t>(255 - amount)) /
+               255;
+    };
+    return lv_color_make(static_cast<uint8_t>(mix((rgb >> 16) & 0xff, (base >> 16) & 0xff)),
+                         static_cast<uint8_t>(mix((rgb >> 8) & 0xff, (base >> 8) & 0xff)),
+                         static_cast<uint8_t>(mix(rgb & 0xff, base & 0xff)));
+}
 }  // namespace
 
 HomePage::HomePage(Display* display, int width, int height, LvglTheme* theme)
@@ -232,6 +263,10 @@ HomePage::~HomePage() {
     if (hint_timer_ != nullptr) {
         lv_timer_delete(hint_timer_);
         hint_timer_ = nullptr;
+    }
+    if (home_clock_timer_ != nullptr) {
+        lv_timer_delete(home_clock_timer_);
+        home_clock_timer_ = nullptr;
     }
 #if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
     if (music_timer_ != nullptr) {
@@ -255,6 +290,10 @@ HomePage::~HomePage() {
     if (camera_root_ != nullptr) {
         lv_obj_del(camera_root_);
     }
+    for (void* p : home_click_data_) {
+        delete static_cast<AppClickData*>(p);
+    }
+    home_click_data_.clear();
     if (home_root_ != nullptr) {
         lv_obj_del(home_root_);
     }
@@ -309,10 +348,6 @@ void HomePage::CreateUi(LvglTheme* theme) {
     const int line_height = theme != nullptr && theme->text_font() != nullptr
                                 ? theme->text_font()->font()->line_height
                                 : 16;
-    const int padding = std::max(2, std::min(8, height_ / 30));
-    const int button_height = std::max(line_height + 12, height_ * 20 / 100);
-    const int entry_width = width_ * 80 / 100;
-
     // Camera and gallery use a nearly full-screen preview with small floating
     // icon buttons instead of a stack of wide text buttons.
     const int margin = std::max(2, std::min(8, height_ / 40));
@@ -330,18 +365,10 @@ void HomePage::CreateUi(LvglTheme* theme) {
     const int progress_width = preview_width_ * 60 / 100;
     const int progress_bottom = margin + 2;
 
-    home_root_ = CreateRoot(screen, width_, height_, padding);
-    auto* home_title = lv_label_create(home_root_);
-    lv_label_set_text(home_title, Lang::Strings::HOME_TITLE);
-    auto* home_hint = lv_label_create(home_root_);
-    lv_label_set_text(home_hint, Lang::Strings::HOME_HINT);
-    lv_obj_set_style_text_align(home_hint, LV_TEXT_ALIGN_CENTER, 0);
-    camera_button_ =
-        CreateButton(home_root_, Lang::Strings::HOME_CAMERA, entry_width, button_height);
-#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
-    music_button_ = CreateButton(home_root_, Lang::Strings::HOME_MUSIC, entry_width, button_height);
-#endif
-    ai_button_ = CreateButton(home_root_, Lang::Strings::HOME_AI_CHAT, entry_width, button_height);
+    home_root_ = CreateRoot(screen, width_, height_, 0);
+
+    // The launcher is a self-contained, fixed dark neon design (see CreateLauncher).
+    CreateLauncher(theme);
 
     camera_root_ = CreateRoot(screen, width_, height_, 0, false);
     auto camera_box = CreateImageBox(camera_root_, preview_width_, preview_height_);
@@ -524,28 +551,8 @@ void HomePage::CreateUi(LvglTheme* theme) {
     home_button_ = CreateIconButton(screen, MATERIAL_SYMBOLS_HOME, icon_size);
     lv_obj_align(home_button_, LV_ALIGN_LEFT_MID, margin, 0);
 
-    lv_obj_add_event_cb(
-        camera_button_,
-        [](lv_event_t* e) {
-            static_cast<HomePage*>(lv_event_get_user_data(e))
-                ->RequestView(HomePageView::kCamera, false);
-        },
-        LV_EVENT_CLICKED, this);
-    lv_obj_add_event_cb(
-        ai_button_,
-        [](lv_event_t* e) {
-            static_cast<HomePage*>(lv_event_get_user_data(e))
-                ->RequestView(HomePageView::kAiChat, true);
-        },
-        LV_EVENT_CLICKED, this);
 #if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
-    lv_obj_add_event_cb(
-        music_button_,
-        [](lv_event_t* e) {
-            static_cast<HomePage*>(lv_event_get_user_data(e))
-                ->RequestView(HomePageView::kMusic, false);
-        },
-        LV_EVENT_CLICKED, this);
+
     lv_obj_add_event_cb(
         music_back_button_,
         [](lv_event_t* e) {
@@ -608,8 +615,8 @@ void HomePage::CreateUi(LvglTheme* theme) {
     lv_obj_add_event_cb(
         gallery_back_button_,
         [](lv_event_t* e) {
-            static_cast<HomePage*>(lv_event_get_user_data(e))
-                ->RequestView(HomePageView::kCamera, false);
+            auto* page = static_cast<HomePage*>(lv_event_get_user_data(e));
+            page->RequestView(page->gallery_back_view_, false);
         },
         LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(
@@ -701,11 +708,528 @@ void HomePage::CreateUi(LvglTheme* theme) {
     ApplyTheme(theme);
 }
 
+void HomePage::CreateLauncher(LvglTheme* theme) {
+    const lv_font_t* ui_font = &font_noto_sans_basic_14_1;
+    const int status_h = std::max(18, height_ * kLauncherStatusPercent / 100);
+    const int pager_h = std::max(22, height_ * kLauncherPagerPercent / 100);
+    const int launcher_h = height_ - status_h - pager_h;
+
+#if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
+    constexpr bool kMusicEnabled = true;
+#else
+    constexpr bool kMusicEnabled = false;
+#endif
+#if CONFIG_XIAOZHI_ENABLE_PHOTO_GALLERY
+    constexpr bool kGalleryEnabled = true;
+#else
+    constexpr bool kGalleryEnabled = false;
+#endif
+
+    // The launcher keeps its own dark neon palette on purpose: it is a fixed
+    // product design, while the chat / camera / music pages follow the theme.
+    lv_obj_set_style_bg_color(home_root_, lv_color_hex(0x050810), 0);
+    lv_obj_set_style_bg_opa(home_root_, LV_OPA_COVER, 0);
+
+    /* ---------- 状态栏 ---------- */
+    home_statusbar_ = lv_obj_create(home_root_);
+    lv_obj_set_size(home_statusbar_, width_, status_h);
+    lv_obj_set_style_radius(home_statusbar_, 0, 0);
+    lv_obj_set_style_border_side(home_statusbar_, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(home_statusbar_, 1, 0);
+    lv_obj_set_style_border_color(home_statusbar_, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_border_opa(home_statusbar_, 14, 0);
+    lv_obj_set_style_bg_color(home_statusbar_, lv_color_hex(0x070c15), 0);
+    lv_obj_set_style_bg_grad_color(home_statusbar_, lv_color_hex(0x0b1322), 0);
+    lv_obj_set_style_bg_grad_dir(home_statusbar_, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(home_statusbar_, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_left(home_statusbar_, 10, 0);
+    lv_obj_set_style_pad_right(home_statusbar_, 10, 0);
+    lv_obj_set_style_pad_top(home_statusbar_, 0, 0);
+    lv_obj_set_style_pad_bottom(home_statusbar_, 0, 0);
+    lv_obj_set_flex_flow(home_statusbar_, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(home_statusbar_, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scrollbar_mode(home_statusbar_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(home_statusbar_, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto* sb_left = lv_obj_create(home_statusbar_);
+    lv_obj_set_size(sb_left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(sb_left, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(sb_left, 0, 0);
+    lv_obj_set_style_pad_all(sb_left, 0, 0);
+    lv_obj_set_style_pad_column(sb_left, 5, 0);
+    lv_obj_set_flex_flow(sb_left, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(sb_left, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(sb_left, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto* sb_logo = lv_obj_create(sb_left);
+    lv_obj_set_size(sb_logo, 9, 9);
+    lv_obj_set_style_radius(sb_logo, 3, 0);
+    lv_obj_set_style_bg_color(sb_logo, lv_color_hex(0x38e1f0), 0);
+    lv_obj_set_style_bg_grad_color(sb_logo, lv_color_hex(0xa855f7), 0);
+    lv_obj_set_style_bg_grad_dir(sb_logo, LV_GRAD_DIR_HOR, 0);
+    lv_obj_set_style_bg_opa(sb_logo, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(sb_logo, 0, 0);
+    lv_obj_set_style_shadow_width(sb_logo, 8, 0);
+    lv_obj_set_style_shadow_color(sb_logo, lv_color_hex(0x38e1f0), 0);
+    lv_obj_set_style_shadow_opa(sb_logo, 120, 0);
+    lv_obj_remove_flag(sb_logo, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto* sb_brand = lv_label_create(sb_left);
+    lv_label_set_text(sb_brand, "NEON OS");
+    lv_obj_set_style_text_color(sb_brand, lv_color_hex(0xcddcf3), 0);
+    lv_obj_set_style_text_letter_space(sb_brand, 1, 0);
+    if (ui_font != nullptr) {
+        lv_obj_set_style_text_font(sb_brand, ui_font, 0);
+    }
+
+    home_clock_ = lv_label_create(home_statusbar_);
+    lv_label_set_text(home_clock_, "--:--");
+    lv_obj_set_style_text_color(home_clock_, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_letter_space(home_clock_, 1, 0);
+    if (ui_font != nullptr) {
+        lv_obj_set_style_text_font(home_clock_, ui_font, 0);
+    }
+
+    auto* sb_right = lv_obj_create(home_statusbar_);
+    lv_obj_set_size(sb_right, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(sb_right, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(sb_right, 0, 0);
+    lv_obj_set_style_pad_all(sb_right, 0, 0);
+    lv_obj_set_style_pad_column(sb_right, 4, 0);
+    lv_obj_set_flex_flow(sb_right, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(sb_right, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(sb_right, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto* sb_wifi = lv_label_create(sb_right);
+    lv_label_set_text(sb_wifi, MATERIAL_SYMBOLS_WIFI);
+    auto* sb_bt = lv_label_create(sb_right);
+    lv_label_set_text(sb_bt, MATERIAL_SYMBOLS_BLUETOOTH);
+    home_battery_label_ = lv_label_create(sb_right);
+    lv_label_set_text(home_battery_label_, MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_FULL);
+    home_battery_pct_ = lv_label_create(sb_right);
+    lv_label_set_text(home_battery_pct_, "");
+    if (ui_font != nullptr) {
+        lv_obj_set_style_text_font(home_battery_pct_, ui_font, 0);
+    }
+    for (auto* label : {sb_wifi, sb_bt, home_battery_label_, home_battery_pct_}) {
+        lv_obj_set_style_text_color(label, lv_color_hex(0xa9bbd8), 0);
+    }
+    for (auto* ico : {sb_wifi, sb_bt, home_battery_label_}) {
+        icon_labels_.push_back(ico);
+    }
+
+    /* ---------- 分页网格 ---------- */
+    home_tileview_ = lv_obj_create(home_root_);
+    lv_obj_set_size(home_tileview_, width_, launcher_h);
+    lv_obj_set_style_radius(home_tileview_, 0, 0);
+    lv_obj_set_style_bg_opa(home_tileview_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(home_tileview_, 0, 0);
+    lv_obj_set_style_pad_all(home_tileview_, 0, 0);
+    lv_obj_set_scroll_dir(home_tileview_, LV_DIR_HOR);
+    lv_obj_set_scrollbar_mode(home_tileview_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_scroll_snap_x(home_tileview_, LV_SCROLL_SNAP_CENTER);
+
+    // Labels are Latin on purpose: the built-in text fonts only cover the
+    // lang_config string subset, which lacks most of these app names.
+    std::vector<LauncherPageDef> pages = {
+        {"CONSOLE",
+         "DASHBOARD",
+         0x38e1f0,
+         0x22d3ee,
+         0x3b82f6,
+         {{"CAMERA", MATERIAL_SYMBOLS_PHOTO_CAMERA, true, HomePageView::kCamera, false, 0x38e1f0,
+           0x7dd3fc},
+          {"MUSIC", MATERIAL_SYMBOLS_MUSIC_NOTE, kMusicEnabled, HomePageView::kMusic, false,
+           0x4ade80, 0xa3e635},
+          {"AI CHAT", MATERIAL_SYMBOLS_ROBOT_2, true, HomePageView::kAiChat, true, 0xa78bfa,
+           0xf0abfc},
+          {"GALLERY", MATERIAL_SYMBOLS_IMAGE, kGalleryEnabled, HomePageView::kGallery, false,
+           0xfbbf24, 0xfde68a},
+          {"SETTINGS", MATERIAL_SYMBOLS_SETTINGS, false, HomePageView::kHome, false, 0xfb7185,
+           0xfda4af},
+          {"DISPLAY", MATERIAL_SYMBOLS_BRIGHTNESS_6, false, HomePageView::kHome, false, 0x60a5fa,
+           0xc4b5fd}}},
+        {"SYSTEM",
+         "NETWORK",
+         0xc084fc,
+         0xa855f7,
+         0xf472b6,
+         {{"WI-FI", MATERIAL_SYMBOLS_WIFI, false, HomePageView::kHome, false, 0x4ade80, 0xa7f3d0},
+          {"BT", MATERIAL_SYMBOLS_BLUETOOTH, false, HomePageView::kHome, false, 0x60a5fa, 0xbfdbfe},
+          {"STORAGE", MATERIAL_SYMBOLS_SD_CARD, false, HomePageView::kHome, false, 0x22d3ee,
+           0xa5f3fc},
+          {"INFO", MATERIAL_SYMBOLS_INFO, false, HomePageView::kHome, false, 0xa78bfa, 0xddd6fe},
+          {"LANGUAGE", MATERIAL_SYMBOLS_LANGUAGE, false, HomePageView::kHome, false, 0xfbbf24,
+           0xfef08a},
+          {"POWER", MATERIAL_SYMBOLS_POWER_SETTINGS_NEW, false, HomePageView::kHome, false,
+           0xfb7185, 0xfecdd3}}}};
+
+    home_pages_count_ = static_cast<int>(pages.size());
+    for (auto& pdef : pages) {
+        home_page_titles_.emplace_back(pdef.title);
+        home_page_accents_.push_back(lv_color_hex(pdef.accent));
+    }
+    for (size_t i = 0; i < pages.size(); i++) {
+        CreateLauncherPage(pages[i], static_cast<int>(i), theme);
+    }
+
+    lv_obj_add_event_cb(
+        home_tileview_,
+        [](lv_event_t* e) { static_cast<HomePage*>(lv_event_get_user_data(e))->OnHomeScroll(e); },
+        LV_EVENT_SCROLL_END, this);
+
+    /* ---------- 页码栏 ---------- */
+    home_pager_ = lv_obj_create(home_root_);
+    lv_obj_set_size(home_pager_, width_, pager_h);
+    lv_obj_set_style_radius(home_pager_, 0, 0);
+    lv_obj_set_style_bg_opa(home_pager_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(home_pager_, 0, 0);
+    lv_obj_set_style_pad_all(home_pager_, 0, 0);
+    lv_obj_set_scrollbar_mode(home_pager_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(home_pager_, LV_OBJ_FLAG_SCROLLABLE);
+
+    home_pager_track_ = lv_obj_create(home_pager_);
+    lv_obj_set_size(home_pager_track_, width_, 2);
+    lv_obj_set_style_radius(home_pager_track_, 0, 0);
+    lv_obj_set_style_bg_color(home_pager_track_, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_bg_opa(home_pager_track_, 14, 0);
+    lv_obj_set_style_border_width(home_pager_track_, 0, 0);
+    lv_obj_align(home_pager_track_, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    home_pager_line_ = lv_obj_create(home_pager_);
+    lv_obj_set_size(home_pager_line_, width_ / home_pages_count_, 2);
+    lv_obj_set_style_radius(home_pager_line_, 0, 0);
+    lv_obj_set_style_bg_color(home_pager_line_, lv_color_hex(0x38e1f0), 0);
+    lv_obj_set_style_bg_opa(home_pager_line_, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(home_pager_line_, 0, 0);
+    lv_obj_set_style_shadow_width(home_pager_line_, 8, 0);
+    lv_obj_set_style_shadow_color(home_pager_line_, lv_color_hex(0x38e1f0), 0);
+    lv_obj_set_style_shadow_opa(home_pager_line_, 140, 0);
+    lv_obj_align(home_pager_line_, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    home_page_label_ = lv_label_create(home_pager_);
+    lv_obj_set_style_text_color(home_page_label_, lv_color_hex(0x7c8bab), 0);
+    if (ui_font != nullptr) {
+        lv_obj_set_style_text_font(home_page_label_, ui_font, 0);
+    }
+    lv_obj_align(home_page_label_, LV_ALIGN_LEFT_MID, 11, -2);
+
+    auto* dots = lv_obj_create(home_pager_);
+    lv_obj_set_size(dots, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(dots, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(dots, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_bg_opa(dots, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(dots, 0, 0);
+    lv_obj_set_style_pad_all(dots, 0, 0);
+    lv_obj_set_style_pad_column(dots, 5, 0);
+    lv_obj_align(dots, LV_ALIGN_CENTER, 0, -2);
+    lv_obj_remove_flag(dots, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < home_pages_count_; i++) {
+        auto* dot = lv_obj_create(dots);
+        lv_obj_set_size(dot, i == 0 ? 14 : 4, 4);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(dot, i == 0 ? lv_color_hex(0x38e1f0) : lv_color_hex(0xffffff), 0);
+        lv_obj_set_style_bg_opa(dot, i == 0 ? LV_OPA_COVER : 60, 0);
+        lv_obj_set_style_border_width(dot, 0, 0);
+        home_dots_.push_back(dot);
+    }
+
+    auto* hint = lv_label_create(home_pager_);
+    lv_label_set_text(hint, "SWIPE »");
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x687ba0), 0);
+    if (ui_font != nullptr) {
+        lv_obj_set_style_text_font(hint, ui_font, 0);
+    }
+    lv_obj_align(hint, LV_ALIGN_RIGHT_MID, -11, -2);
+
+    UpdateHomePageIndicator(0);
+    UpdateStatusBarClock();
+
+    home_clock_timer_ = lv_timer_create(
+        [](lv_timer_t* timer) {
+            static_cast<HomePage*>(lv_timer_get_user_data(timer))->UpdateStatusBarClock();
+        },
+        kLauncherClockIntervalMs, this);
+    lv_timer_pause(home_clock_timer_);
+}
+
+void HomePage::CreateLauncherPage(const LauncherPageDef& pdef, int index, LvglTheme* theme) {
+    const lv_font_t* ui_font = &font_noto_sans_basic_14_1;
+    const lv_font_t* icon_font = theme != nullptr && theme->large_icon_font() != nullptr
+                                     ? theme->large_icon_font()->font()
+                                     : nullptr;
+    const int line_height = ui_font != nullptr ? ui_font->line_height : 16;
+    const int status_h = std::max(18, height_ * kLauncherStatusPercent / 100);
+    const int pager_h = std::max(22, height_ * kLauncherPagerPercent / 100);
+    const int launcher_h = height_ - status_h - pager_h;
+    const int head_h = std::max(20, launcher_h * kLauncherHeadPercent / 100);
+    const int grid_h = std::max(1, launcher_h - head_h);
+    const int page_pad = std::max(6, width_ * 2 / 100);
+    const int cell_gap = std::max(4, width_ * 2 / 100);
+    const int cell_w = std::max(1, (width_ - 2 * page_pad - 2 * cell_gap) / 3);
+    const int cell_h = std::max(1, (grid_h - 2 * page_pad - cell_gap) / 2);
+    int card_size = std::min(cell_w - 12, cell_h - line_height - 8);
+    card_size = std::max(24, std::min(card_size, 52));
+
+    auto* page = lv_obj_create(home_tileview_);
+    lv_obj_set_size(page, width_, launcher_h);
+    lv_obj_set_pos(page, index * width_, 0);
+    lv_obj_set_style_radius(page, 0, 0);
+    lv_obj_set_style_border_width(page, 0, 0);
+    lv_obj_set_style_pad_all(page, 0, 0);
+    lv_obj_set_style_bg_color(page, TintColor(pdef.accent, 0x050810, 46), 0);
+    lv_obj_set_style_bg_grad_color(page, lv_color_hex(0x04060c), 0);
+    lv_obj_set_style_bg_grad_dir(page, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, 0);
+    lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Corner glows: two soft discs behind the grid, one per page color.
+    auto* glow_a = lv_obj_create(page);
+    lv_obj_set_size(glow_a, width_ * 66 / 100, launcher_h * 78 / 100);
+    lv_obj_set_pos(glow_a, -width_ * 18 / 100, -launcher_h * 42 / 100);
+    lv_obj_set_style_radius(glow_a, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(glow_a, 0, 0);
+    lv_obj_set_style_bg_color(glow_a, lv_color_hex(pdef.glow_a), 0);
+    lv_obj_set_style_bg_opa(glow_a, 26, 0);
+    lv_obj_set_style_shadow_width(glow_a, 60, 0);
+    lv_obj_set_style_shadow_color(glow_a, lv_color_hex(pdef.glow_a), 0);
+    lv_obj_set_style_shadow_opa(glow_a, 40, 0);
+    lv_obj_add_flag(glow_a, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_remove_flag(glow_a, LV_OBJ_FLAG_CLICKABLE);
+
+    auto* glow_b = lv_obj_create(page);
+    lv_obj_set_size(glow_b, width_ * 62 / 100, launcher_h * 70 / 100);
+    lv_obj_set_pos(glow_b, width_ - width_ * 52 / 100, launcher_h - launcher_h * 34 / 100);
+    lv_obj_set_style_radius(glow_b, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(glow_b, 0, 0);
+    lv_obj_set_style_bg_color(glow_b, lv_color_hex(pdef.glow_b), 0);
+    lv_obj_set_style_bg_opa(glow_b, 22, 0);
+    lv_obj_set_style_shadow_width(glow_b, 50, 0);
+    lv_obj_set_style_shadow_color(glow_b, lv_color_hex(pdef.glow_b), 0);
+    lv_obj_set_style_shadow_opa(glow_b, 34, 0);
+    lv_obj_add_flag(glow_b, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_remove_flag(glow_b, LV_OBJ_FLAG_CLICKABLE);
+
+    // Concentric ring, the "instrument" motif of the reference design.
+    auto* ring = lv_obj_create(page);
+    const int ring_size = launcher_h * 88 / 100;
+    lv_obj_set_size(ring, ring_size, ring_size);
+    lv_obj_set_pos(ring, width_ - ring_size * 66 / 100, launcher_h * 16 / 100);
+    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ring, 1, 0);
+    lv_obj_set_style_border_color(ring, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_border_opa(ring, 18, 0);
+    lv_obj_add_flag(ring, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
+
+    /* ---------- 页头 ---------- */
+    auto* head = lv_obj_create(page);
+    lv_obj_set_size(head, width_, head_h);
+    lv_obj_set_pos(head, 0, 0);
+    lv_obj_set_style_bg_opa(head, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(head, 0, 0);
+    lv_obj_set_style_pad_left(head, 13, 0);
+    lv_obj_set_style_pad_right(head, 13, 0);
+    lv_obj_set_style_pad_top(head, 2, 0);
+    lv_obj_set_style_pad_bottom(head, 0, 0);
+    lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(head, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(head, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto* head_left = lv_obj_create(head);
+    lv_obj_set_size(head_left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(head_left, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(head_left, 0, 0);
+    lv_obj_set_style_pad_all(head_left, 0, 0);
+    lv_obj_set_style_pad_column(head_left, 8, 0);
+    lv_obj_set_flex_flow(head_left, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(head_left, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(head_left, LV_OBJ_FLAG_SCROLLABLE);
+
+    char number[16];
+    snprintf(number, sizeof(number), "%02d", index + 1);
+    auto* head_num = lv_label_create(head_left);
+    lv_label_set_text(head_num, number);
+    lv_obj_set_style_text_color(head_num, lv_color_hex(pdef.accent), 0);
+    if (ui_font != nullptr) {
+        lv_obj_set_style_text_font(head_num, ui_font, 0);
+    }
+
+    auto* head_title = lv_label_create(head_left);
+    lv_label_set_text(head_title, pdef.title);
+    lv_obj_set_style_text_color(head_title, lv_color_hex(0xf2f7ff), 0);
+    if (ui_font != nullptr) {
+        lv_obj_set_style_text_font(head_title, ui_font, 0);
+    }
+
+    auto* head_label = lv_label_create(head);
+    lv_label_set_text(head_label, pdef.label);
+    lv_obj_set_style_text_color(head_label, lv_color_hex(0x8292b0), 0);
+    lv_obj_set_style_text_letter_space(head_label, 1, 0);
+    lv_obj_set_style_transform_scale(head_label, 180, 0);
+    if (ui_font != nullptr) {
+        lv_obj_set_style_text_font(head_label, ui_font, 0);
+    }
+
+    /* ---------- 应用网格 ---------- */
+    auto* grid = lv_obj_create(page);
+    lv_obj_set_size(grid, width_, grid_h);
+    lv_obj_set_pos(grid, 0, head_h);
+    lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(grid, 0, 0);
+    lv_obj_set_style_pad_all(grid, page_pad, 0);
+    lv_obj_set_style_pad_row(grid, cell_gap, 0);
+    lv_obj_set_style_pad_column(grid, cell_gap, 0);
+    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_scrollbar_mode(grid, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (auto& app : pdef.apps) {
+        auto* cell = lv_obj_create(grid);
+        lv_obj_set_size(cell, cell_w, cell_h);
+        lv_obj_set_style_bg_opa(cell, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(cell, 0, 0);
+        lv_obj_set_style_pad_all(cell, 0, 0);
+        lv_obj_set_style_pad_row(cell, 5, 0);
+        lv_obj_set_flex_flow(cell, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(cell, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_remove_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
+
+        auto* card = lv_obj_create(cell);
+        lv_obj_set_size(card, card_size, card_size);
+        lv_obj_set_style_radius(card, card_size * 30 / 100, 0);
+        lv_obj_set_style_pad_all(card, 0, 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x1d2735), 0);
+        lv_obj_set_style_bg_grad_color(card, lv_color_hex(0x0d131c), 0);
+        lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
+        lv_obj_set_style_bg_opa(card, 232, 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(0xffffff), 0);
+        lv_obj_set_style_border_opa(card, 34, 0);
+        lv_obj_set_style_shadow_width(card, card_size * 40 / 100, 0);
+        lv_obj_set_style_shadow_offset_y(card, 2, 0);
+        lv_obj_set_style_shadow_color(card, lv_color_hex(app.icon_color), 0);
+        lv_obj_set_style_shadow_opa(card, 72, 0);
+        lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        if (!app.enabled) {
+            // Reserved entries stay visible but clearly inactive.
+            lv_obj_set_style_opa(card, 140, 0);
+            lv_obj_remove_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        }
+
+        // Glass highlight along the top edge.
+        auto* shine = lv_obj_create(card);
+        lv_obj_set_size(shine, card_size * 62 / 100, 1);
+        lv_obj_align(shine, LV_ALIGN_TOP_MID, 0, 3);
+        lv_obj_set_style_radius(shine, 1, 0);
+        lv_obj_set_style_bg_color(shine, lv_color_hex(0xffffff), 0);
+        lv_obj_set_style_bg_opa(shine, 70, 0);
+        lv_obj_set_style_border_width(shine, 0, 0);
+        lv_obj_remove_flag(shine, LV_OBJ_FLAG_CLICKABLE);
+
+        auto* ico = lv_label_create(card);
+        lv_label_set_text(ico, app.icon);
+        lv_obj_set_style_text_color(ico, lv_color_hex(app.icon_color), 0);
+        if (icon_font != nullptr) {
+            lv_obj_set_style_text_font(ico, icon_font, 0);
+        }
+        lv_obj_center(ico);
+        home_app_icons_.push_back(ico);
+
+        auto* dot = lv_obj_create(card);
+        lv_obj_set_size(dot, 4, 4);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(app.dot_color), 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(dot, 0, 0);
+        lv_obj_set_style_shadow_width(dot, 6, 0);
+        lv_obj_set_style_shadow_color(dot, lv_color_hex(app.dot_color), 0);
+        lv_obj_set_style_shadow_opa(dot, 160, 0);
+        lv_obj_align(dot, LV_ALIGN_BOTTOM_RIGHT, -6, -6);
+        lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+
+        auto* name = lv_label_create(cell);
+        lv_label_set_text(name, app.name);
+        lv_obj_set_style_text_color(name, lv_color_hex(app.enabled ? 0xc9d7ee : 0x7c8bab), 0);
+        lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+        if (ui_font != nullptr) {
+            lv_obj_set_style_text_font(name, ui_font, 0);
+        }
+
+        if (app.enabled) {
+            lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+            auto* cd = new AppClickData{this, app.view, app.wake};
+            home_click_data_.push_back(cd);
+            lv_obj_add_event_cb(
+                card,
+                [](lv_event_t* e) {
+                    auto* d = static_cast<AppClickData*>(lv_event_get_user_data(e));
+                    d->self->RequestView(d->view, d->wake);
+                },
+                LV_EVENT_CLICKED, cd);
+        }
+    }
+}
+
+void HomePage::UpdateStatusBarClock() {
+    if (home_clock_ != nullptr) {
+        const time_t now = time(nullptr);
+        struct tm now_tm = {};
+        localtime_r(&now, &now_tm);
+        if (now_tm.tm_year >= 2025 - 1900) {
+            char buf[8];
+            strftime(buf, sizeof(buf), "%H:%M", &now_tm);
+            if (strcmp(lv_label_get_text(home_clock_), buf) != 0) {
+                lv_label_set_text(home_clock_, buf);
+            }
+        }
+    }
+
+    int level = 0;
+    bool charging = false;
+    bool discharging = false;
+    // Boards without a battery gauge keep the icons hidden instead of a fake level.
+    const bool has_battery = Board::GetInstance().GetBatteryLevel(level, charging, discharging);
+    SetObjectVisible(home_battery_label_, has_battery);
+    SetObjectVisible(home_battery_pct_, has_battery);
+    if (!has_battery) {
+        return;
+    }
+
+    if (charging) {
+        lv_label_set_text(home_battery_label_, MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_BOLT);
+    } else {
+        const char* levels[] = {
+            MATERIAL_SYMBOLS_BATTERY_ANDROID_0,       MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_1,
+            MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_2, MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_3,
+            MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_4, MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_5,
+            MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_6, MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_FULL,
+        };
+        const int level_index = level <= 0 ? 0 : (level >= 100 ? 7 : 1 + ((level - 1) * 6 / 99));
+        lv_label_set_text(home_battery_label_, levels[level_index]);
+    }
+
+    char pct[8];
+    snprintf(pct, sizeof(pct), "%d%%", level);
+    lv_label_set_text(home_battery_pct_, pct);
+}
+
 void HomePage::ApplyTheme(LvglTheme* theme) {
     if (theme == nullptr) {
         return;
     }
-    for (auto* root : {home_root_, camera_root_, gallery_root_}) {
+    // home_root_ is left out on purpose: the launcher owns a fixed dark neon
+    // palette so a light chat theme cannot wash it out.
+    for (auto* root : {camera_root_, gallery_root_}) {
         if (root == nullptr) {
             continue;
         }
@@ -718,9 +1242,9 @@ void HomePage::ApplyTheme(LvglTheme* theme) {
         }
     }
     for (auto* button :
-         {camera_button_, ai_button_, capture_button_, gallery_button_, back_button_, video_button_,
-          gallery_prev_button_, gallery_next_button_, gallery_back_button_, gallery_delete_button_,
-          video_play_button_, gallery_vol_up_button_, gallery_vol_down_button_, home_button_}) {
+         {capture_button_, gallery_button_, back_button_, video_button_, gallery_prev_button_,
+          gallery_next_button_, gallery_back_button_, gallery_delete_button_, video_play_button_,
+          gallery_vol_up_button_, gallery_vol_down_button_, home_button_}) {
         if (button == nullptr) {
             continue;
         }
@@ -744,7 +1268,7 @@ void HomePage::ApplyTheme(LvglTheme* theme) {
         lv_obj_set_style_bg_color(music_list_, theme->background_color(), 0);
         lv_obj_set_style_border_color(music_list_, theme->border_color(), 0);
     }
-    for (auto* button : {music_button_, music_back_button_, music_play_button_, music_prev_button_,
+    for (auto* button : {music_back_button_, music_play_button_, music_prev_button_,
                          music_next_button_, music_vol_up_button_, music_vol_down_button_}) {
         if (button == nullptr) {
             continue;
@@ -771,9 +1295,62 @@ void HomePage::ApplyTheme(LvglTheme* theme) {
             lv_obj_set_style_text_font(label, icon_font, 0);
         }
     }
+    // Launcher tiles use the larger glyph face so the icons fill the glass tile.
+    if (theme->large_icon_font() != nullptr && theme->large_icon_font()->font() != nullptr) {
+        auto* large_icon_font = theme->large_icon_font()->font();
+        for (auto* label : home_app_icons_) {
+            lv_obj_set_style_text_font(label, large_icon_font, 0);
+        }
+    }
+}
+
+void HomePage::OnHomeScroll(lv_event_t* e) {
+    (void)e;
+    if (home_tileview_ == nullptr || home_pages_count_ <= 0) {
+        return;
+    }
+    int scroll = lv_obj_get_scroll_x(home_tileview_);
+    int page = (-scroll + width_ / 2) / width_;
+    page = std::max(0, std::min(home_pages_count_ - 1, page));
+    UpdateHomePageIndicator(page);
+}
+
+void HomePage::UpdateHomePageIndicator(int page) {
+    if (home_page_label_ != nullptr && page >= 0 &&
+        page < static_cast<int>(home_page_titles_.size())) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%02d / %02d · %s", page + 1, home_pages_count_,
+                 home_page_titles_[page].c_str());
+        lv_label_set_text(home_page_label_, buf);
+    }
+    const lv_color_t accent = page >= 0 && page < static_cast<int>(home_page_accents_.size())
+                                  ? home_page_accents_[page]
+                                  : lv_color_hex(0x38e1f0);
+    for (size_t i = 0; i < home_dots_.size(); i++) {
+        lv_obj_t* dot = home_dots_[i];
+        const bool on = static_cast<int>(i) == page;
+        lv_obj_set_size(dot, on ? 14 : 4, 4);
+        lv_obj_set_style_bg_color(dot, on ? accent : lv_color_hex(0xffffff), 0);
+        lv_obj_set_style_bg_opa(dot, on ? LV_OPA_COVER : 60, 0);
+        lv_obj_set_style_shadow_color(dot, accent, 0);
+        lv_obj_set_style_shadow_width(dot, on ? 8 : 0, 0);
+        lv_obj_set_style_shadow_opa(dot, on ? 140 : 0, 0);
+    }
+    if (home_pager_line_ != nullptr && home_pages_count_ > 0) {
+        const int seg = width_ / home_pages_count_;
+        lv_obj_set_size(home_pager_line_, seg, 2);
+        lv_obj_set_style_bg_color(home_pager_line_, accent, 0);
+        lv_obj_set_style_shadow_color(home_pager_line_, accent, 0);
+        lv_obj_align(home_pager_line_, LV_ALIGN_BOTTOM_LEFT, page * seg, 0);
+    }
 }
 
 void HomePage::RequestView(HomePageView view, bool wake_ai) {
+    if (view == HomePageView::kGallery) {
+        // The gallery's back button returns to whichever page opened it.
+        gallery_back_view_ =
+            view_.load() == HomePageView::kCamera ? HomePageView::kCamera : HomePageView::kHome;
+    }
     // UI callbacks run on the LVGL task. Do the page switch on the main task so
     // joining the worker can never deadlock with the display lock.
     Display* display = display_;
@@ -859,6 +1436,16 @@ void HomePage::SetView(HomePageView view) {
     SetVideoIcon(MATERIAL_SYMBOLS_PLAY_ARROW);
     if (hint_timer_ != nullptr) {
         lv_timer_pause(hint_timer_);
+    }
+    // The launcher clock / battery only ticks while the launcher is on screen.
+    if (home_clock_timer_ != nullptr) {
+        if (view == HomePageView::kHome) {
+            UpdateStatusBarClock();
+            lv_timer_reset(home_clock_timer_);
+            lv_timer_resume(home_clock_timer_);
+        } else {
+            lv_timer_pause(home_clock_timer_);
+        }
     }
     SetObjectVisible(camera_hint_, false);
     SetObjectVisible(home_root_, view == HomePageView::kHome);
