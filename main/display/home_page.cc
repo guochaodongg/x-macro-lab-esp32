@@ -35,10 +35,18 @@
 LV_FONT_DECLARE(font_noto_sans_basic_14_1);
 
 namespace {
+// Per-page launcher payload, shared by the page painter, the hero-tile painter
+// and the click handler so a page owns a single heap allocation.
 struct AppClickData {
     HomePage* self;
     HomePageView view;
     bool wake;
+    bool enabled;
+    HomePage::LauncherIcon icon;
+    uint32_t accent;
+    uint32_t accent2;
+    uint32_t glow_a;
+    uint32_t glow_b;
 };
 // Capture() itself blocks on the sensor and the LVGL lock, so this is only a
 // ceiling on how often the preview task wakes up, not a fixed frame interval.
@@ -229,10 +237,9 @@ std::shared_ptr<CapturedFrame> CopyRgb565Frame(const lv_img_dsc_t* dsc) {
 #endif
 
 // Launcher proportions, as a percentage of the display height. They follow the
-// 320x240 reference design: 22px status bar, 26px pager, the rest is the grid.
+// 320x240 reference design: 22px status bar, 26px pager, 194px hero page.
 constexpr int kLauncherStatusPercent = 9;
 constexpr int kLauncherPagerPercent = 11;
-constexpr int kLauncherHeadPercent = 14;
 constexpr int kLauncherClockIntervalMs = 5000;
 
 // Blend `rgb` toward `base`: 0 keeps base, 255 keeps rgb.
@@ -245,6 +252,192 @@ lv_color_t TintColor(uint32_t rgb, uint32_t base, uint8_t amount) {
     return lv_color_make(static_cast<uint8_t>(mix((rgb >> 16) & 0xff, (base >> 16) & 0xff)),
                          static_cast<uint8_t>(mix((rgb >> 8) & 0xff, (base >> 8) & 0xff)),
                          static_cast<uint8_t>(mix(rgb & 0xff, base & 0xff)));
+}
+
+// Soft colour wash. Two stacked discs of the same hue fake a blurred gradient
+// at the cost of two plain fills; a real shadow over this area would cost more
+// to rasterize than everything else on the page together.
+void DrawLauncherWash(lv_layer_t* layer, int32_t cx, int32_t cy, int32_t r, uint32_t rgb) {
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.radius = LV_RADIUS_CIRCLE;
+    dsc.bg_color = lv_color_hex(rgb);
+
+    lv_area_t area = {cx - r, cy - r, cx + r, cy + r};
+    dsc.bg_opa = 12;
+    lv_draw_rect(layer, &dsc, &area);
+
+    const int32_t inner = r * 58 / 100;
+    area = {cx - inner, cy - inner, cx + inner, cy + inner};
+    dsc.bg_opa = 18;
+    lv_draw_rect(layer, &dsc, &area);
+}
+
+// Everything behind the hero tile: the 20px technical grid, the two corner
+// washes and the dashed orbit ring. Stroked straight into the layer, so a page
+// owns no background objects at all.
+void DrawLauncherBackground(lv_event_t* e) {
+    auto* page = static_cast<lv_obj_t*>(lv_event_get_target(e));
+    auto* data = static_cast<AppClickData*>(lv_event_get_user_data(e));
+    lv_layer_t* layer = lv_event_get_layer(e);
+    if (page == nullptr || data == nullptr || layer == nullptr) {
+        return;
+    }
+
+    lv_area_t coords;
+    lv_obj_get_coords(page, &coords);
+    const int32_t w = lv_area_get_width(&coords);
+    const int32_t h = lv_area_get_height(&coords);
+
+    lv_draw_line_dsc_t line_dsc;
+    lv_draw_line_dsc_init(&line_dsc);
+    line_dsc.color = lv_color_white();
+    line_dsc.opa = 9;
+    line_dsc.width = 1;
+    for (int32_t x = coords.x1; x <= coords.x2; x += 20) {
+        line_dsc.p1.x = x;
+        line_dsc.p1.y = coords.y1;
+        line_dsc.p2.x = x;
+        line_dsc.p2.y = coords.y2;
+        lv_draw_line(layer, &line_dsc);
+    }
+    for (int32_t y = coords.y1; y <= coords.y2; y += 20) {
+        line_dsc.p1.x = coords.x1;
+        line_dsc.p1.y = y;
+        line_dsc.p2.x = coords.x2;
+        line_dsc.p2.y = y;
+        lv_draw_line(layer, &line_dsc);
+    }
+
+    const int32_t cx = coords.x1 + w / 2;
+    const int32_t cy = coords.y1 + h / 2;
+    DrawLauncherWash(layer, coords.x1 + w * 4 / 100, cy - h * 12 / 100, h * 66 / 100, data->glow_a);
+    DrawLauncherWash(layer, coords.x2 - w * 4 / 100, cy + h * 26 / 100, h * 58 / 100, data->glow_b);
+
+    // Dashed orbit ring around the hero tile.
+    const int32_t radius = h * 48 / 100;
+    lv_draw_line_dsc_t dash_dsc;
+    lv_draw_line_dsc_init(&dash_dsc);
+    dash_dsc.color = lv_color_white();
+    dash_dsc.opa = 62;
+    dash_dsc.width = 1;
+    dash_dsc.round_start = 1;
+    dash_dsc.round_end = 1;
+    for (int32_t i = 0; i < 36; i++) {
+        const int16_t a_start = static_cast<int16_t>(i * 10);
+        const int16_t a_end = static_cast<int16_t>(i * 10 + 6);
+        dash_dsc.p1.x = cx + lv_trigo_cos(a_start) * radius / 32767;
+        dash_dsc.p1.y = cy + lv_trigo_sin(a_start) * radius / 32767;
+        dash_dsc.p2.x = cx + lv_trigo_cos(a_end) * radius / 32767;
+        dash_dsc.p2.y = cy + lv_trigo_sin(a_end) * radius / 32767;
+        lv_draw_line(layer, &dash_dsc);
+    }
+}
+
+// Hero glyph, drawn as vector strokes: crisp at the reference size, no font
+// glyph or bitmap asset involved, and it picks up the page accent colours.
+void DrawLauncherIcon(lv_event_t* e) {
+    auto* card = static_cast<lv_obj_t*>(lv_event_get_target(e));
+    auto* data = static_cast<AppClickData*>(lv_event_get_user_data(e));
+    lv_layer_t* layer = lv_event_get_layer(e);
+    if (card == nullptr || data == nullptr || layer == nullptr) {
+        return;
+    }
+
+    lv_area_t coords;
+    lv_obj_get_coords(card, &coords);
+    const int32_t card_w = lv_area_get_width(&coords);
+    const int32_t box = card_w * 56 / 100;
+    const int32_t ox = coords.x1 + (card_w - box) / 2;
+    const int32_t oy = coords.y1 + (lv_area_get_height(&coords) - box) / 2;
+    const lv_color_t c1 = lv_color_hex(data->accent);
+    const lv_color_t c2 = lv_color_hex(data->accent2);
+    const int32_t stroke = std::max<int32_t>(2, box * 5 / 100);
+
+    // Design space is 64x64 for every glyph.
+    auto px = [&](int32_t v) { return ox + v * box / 64; };
+    auto py = [&](int32_t v) { return oy + v * box / 64; };
+
+    auto fill_circle = [&](int32_t cx, int32_t cy, int32_t r, lv_color_t color, lv_opa_t opa) {
+        lv_draw_rect_dsc_t dsc;
+        lv_draw_rect_dsc_init(&dsc);
+        dsc.radius = LV_RADIUS_CIRCLE;
+        dsc.bg_color = color;
+        dsc.bg_opa = opa;
+        lv_area_t area = {px(cx - r), py(cy - r), px(cx + r) - 1, py(cy + r) - 1};
+        lv_draw_rect(layer, &dsc, &area);
+    };
+    auto stroke_circle = [&](int32_t cx, int32_t cy, int32_t r) {
+        lv_draw_rect_dsc_t dsc;
+        lv_draw_rect_dsc_init(&dsc);
+        dsc.radius = LV_RADIUS_CIRCLE;
+        dsc.bg_opa = LV_OPA_TRANSP;
+        dsc.border_color = c1;
+        dsc.border_opa = LV_OPA_COVER;
+        dsc.border_width = stroke;
+        lv_area_t area = {px(cx - r), py(cy - r), px(cx + r) - 1, py(cy + r) - 1};
+        lv_draw_rect(layer, &dsc, &area);
+    };
+    auto stroke_box = [&](int32_t x, int32_t y, int32_t bw, int32_t bh, int32_t br) {
+        lv_draw_rect_dsc_t dsc;
+        lv_draw_rect_dsc_init(&dsc);
+        dsc.radius = br * box / 64;
+        dsc.bg_opa = LV_OPA_TRANSP;
+        dsc.border_color = c1;
+        dsc.border_opa = LV_OPA_COVER;
+        dsc.border_width = stroke;
+        lv_area_t area = {px(x), py(y), px(x + bw) - 1, py(y + bh) - 1};
+        lv_draw_rect(layer, &dsc, &area);
+    };
+    auto stroke_line = [&](int32_t x1, int32_t y1, int32_t x2, int32_t y2, lv_color_t color) {
+        lv_draw_line_dsc_t dsc;
+        lv_draw_line_dsc_init(&dsc);
+        dsc.color = color;
+        dsc.opa = LV_OPA_COVER;
+        dsc.width = stroke;
+        dsc.round_start = 1;
+        dsc.round_end = 1;
+        dsc.p1.x = px(x1);
+        dsc.p1.y = py(y1);
+        dsc.p2.x = px(x2);
+        dsc.p2.y = py(y2);
+        lv_draw_line(layer, &dsc);
+    };
+
+    // Faint bloom behind the glyph, so the tile does not look flat.
+    fill_circle(32, 32, 29, c1, 16);
+
+    switch (data->icon) {
+        case HomePage::LauncherIcon::kCamera:
+            stroke_box(5, 19, 54, 33, 11);
+            stroke_box(22, 11, 20, 10, 4);
+            stroke_circle(32, 36, 10);
+            fill_circle(48, 26, 2, c2, LV_OPA_COVER);
+            break;
+        case HomePage::LauncherIcon::kChat:
+            stroke_box(4, 10, 56, 32, 13);
+            stroke_line(17, 42, 17, 55, c1);
+            stroke_line(17, 55, 31, 42, c1);
+            fill_circle(22, 26, 3, c2, LV_OPA_COVER);
+            fill_circle(32, 26, 3, c2, LV_OPA_COVER);
+            fill_circle(42, 26, 3, c2, LV_OPA_COVER);
+            break;
+        case HomePage::LauncherIcon::kMusic:
+            stroke_circle(18, 45, 9);
+            stroke_circle(41, 39, 9);
+            stroke_line(27, 45, 27, 12, c1);
+            stroke_line(50, 39, 50, 7, c1);
+            stroke_line(27, 12, 50, 7, c2);
+            break;
+        case HomePage::LauncherIcon::kGallery:
+            stroke_box(5, 12, 54, 40, 8);
+            fill_circle(20, 24, 4, c2, LV_OPA_COVER);
+            stroke_line(12, 46, 25, 32, c1);
+            stroke_line(25, 32, 35, 42, c1);
+            stroke_line(35, 42, 46, 31, c1);
+            stroke_line(46, 31, 55, 40, c1);
+            break;
+    }
 }
 }  // namespace
 
@@ -712,7 +905,7 @@ void HomePage::CreateLauncher(LvglTheme* theme) {
     const lv_font_t* ui_font = &font_noto_sans_basic_14_1;
     const int status_h = std::max(18, height_ * kLauncherStatusPercent / 100);
     const int pager_h = std::max(22, height_ * kLauncherPagerPercent / 100);
-    const int launcher_h = height_ - status_h - pager_h;
+    const int page_h = height_ - status_h - pager_h;
 
 #if CONFIG_XIAOZHI_ENABLE_MUSIC_PLAYER
     constexpr bool kMusicEnabled = true;
@@ -777,7 +970,7 @@ void HomePage::CreateLauncher(LvglTheme* theme) {
     lv_obj_remove_flag(sb_logo, LV_OBJ_FLAG_SCROLLABLE);
 
     auto* sb_brand = lv_label_create(sb_left);
-    lv_label_set_text(sb_brand, "NEON OS");
+    lv_label_set_text(sb_brand, "X-Macro-Lab");
     lv_obj_set_style_text_color(sb_brand, lv_color_hex(0xcddcf3), 0);
     lv_obj_set_style_text_letter_space(sb_brand, 1, 0);
     if (ui_font != nullptr) {
@@ -821,9 +1014,9 @@ void HomePage::CreateLauncher(LvglTheme* theme) {
         icon_labels_.push_back(ico);
     }
 
-    /* ---------- 分页网格 ---------- */
+    /* ---------- 单页单图标 ---------- */
     home_tileview_ = lv_obj_create(home_root_);
-    lv_obj_set_size(home_tileview_, width_, launcher_h);
+    lv_obj_set_size(home_tileview_, width_, page_h);
     lv_obj_set_style_radius(home_tileview_, 0, 0);
     lv_obj_set_style_bg_opa(home_tileview_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(home_tileview_, 0, 0);
@@ -831,49 +1024,29 @@ void HomePage::CreateLauncher(LvglTheme* theme) {
     lv_obj_set_scroll_dir(home_tileview_, LV_DIR_HOR);
     lv_obj_set_scrollbar_mode(home_tileview_, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_scroll_snap_x(home_tileview_, LV_SCROLL_SNAP_CENTER);
+    // Rubber band at both ends, like the reference prototype's 0.35x damping.
+    lv_obj_add_flag(home_tileview_, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_remove_flag(home_tileview_, LV_OBJ_FLAG_CLICKABLE);
 
-    // Labels are Latin on purpose: the built-in text fonts only cover the
-    // lang_config string subset, which lacks most of these app names.
+    // One feature per page, ordered by how often it is used; the colours follow
+    // the prototype's per-page accent pairs.
     std::vector<LauncherPageDef> pages = {
-        {"CONSOLE",
-         "DASHBOARD",
-         0x38e1f0,
-         0x22d3ee,
-         0x3b82f6,
-         {{"CAMERA", MATERIAL_SYMBOLS_PHOTO_CAMERA, true, HomePageView::kCamera, false, 0x38e1f0,
-           0x7dd3fc},
-          {"MUSIC", MATERIAL_SYMBOLS_MUSIC_NOTE, kMusicEnabled, HomePageView::kMusic, false,
-           0x4ade80, 0xa3e635},
-          {"AI CHAT", MATERIAL_SYMBOLS_ROBOT_2, true, HomePageView::kAiChat, true, 0xa78bfa,
-           0xf0abfc},
-          {"GALLERY", MATERIAL_SYMBOLS_IMAGE, kGalleryEnabled, HomePageView::kGallery, false,
-           0xfbbf24, 0xfde68a},
-          {"SETTINGS", MATERIAL_SYMBOLS_SETTINGS, false, HomePageView::kHome, false, 0xfb7185,
-           0xfda4af},
-          {"DISPLAY", MATERIAL_SYMBOLS_BRIGHTNESS_6, false, HomePageView::kHome, false, 0x60a5fa,
-           0xc4b5fd}}},
-        {"SYSTEM",
-         "NETWORK",
-         0xc084fc,
-         0xa855f7,
-         0xf472b6,
-         {{"WI-FI", MATERIAL_SYMBOLS_WIFI, false, HomePageView::kHome, false, 0x4ade80, 0xa7f3d0},
-          {"BT", MATERIAL_SYMBOLS_BLUETOOTH, false, HomePageView::kHome, false, 0x60a5fa, 0xbfdbfe},
-          {"STORAGE", MATERIAL_SYMBOLS_SD_CARD, false, HomePageView::kHome, false, 0x22d3ee,
-           0xa5f3fc},
-          {"INFO", MATERIAL_SYMBOLS_INFO, false, HomePageView::kHome, false, 0xa78bfa, 0xddd6fe},
-          {"LANGUAGE", MATERIAL_SYMBOLS_LANGUAGE, false, HomePageView::kHome, false, 0xfbbf24,
-           0xfef08a},
-          {"POWER", MATERIAL_SYMBOLS_POWER_SETTINGS_NEW, false, HomePageView::kHome, false,
-           0xfb7185, 0xfecdd3}}}};
+        {LauncherIcon::kCamera, 0x38e1f0, 0x7dd3fc, 0x22d3ee, 0x3b82f6, true, HomePageView::kCamera,
+         false},
+        {LauncherIcon::kChat, 0xc084fc, 0xf5d0fe, 0xa855f7, 0xf472b6, true, HomePageView::kAiChat,
+         true},
+        {LauncherIcon::kMusic, 0x4ade80, 0xd9f99d, 0x10b981, 0x22d3ee, kMusicEnabled,
+         HomePageView::kMusic, false},
+        {LauncherIcon::kGallery, 0xfbbf24, 0xfde68a, 0xf59e0b, 0xfb7185, kGalleryEnabled,
+         HomePageView::kGallery, false},
+    };
 
     home_pages_count_ = static_cast<int>(pages.size());
     for (auto& pdef : pages) {
-        home_page_titles_.emplace_back(pdef.title);
         home_page_accents_.push_back(lv_color_hex(pdef.accent));
     }
     for (size_t i = 0; i < pages.size(); i++) {
-        CreateLauncherPage(pages[i], static_cast<int>(i), theme);
+        CreateLauncherPage(pages[i], static_cast<int>(i));
     }
 
     lv_obj_add_event_cb(
@@ -881,7 +1054,7 @@ void HomePage::CreateLauncher(LvglTheme* theme) {
         [](lv_event_t* e) { static_cast<HomePage*>(lv_event_get_user_data(e))->OnHomeScroll(e); },
         LV_EVENT_SCROLL_END, this);
 
-    /* ---------- 页码栏 ---------- */
+    /* ---------- 页码点 ---------- */
     home_pager_ = lv_obj_create(home_root_);
     lv_obj_set_size(home_pager_, width_, pager_h);
     lv_obj_set_style_radius(home_pager_, 0, 0);
@@ -890,32 +1063,7 @@ void HomePage::CreateLauncher(LvglTheme* theme) {
     lv_obj_set_style_pad_all(home_pager_, 0, 0);
     lv_obj_set_scrollbar_mode(home_pager_, LV_SCROLLBAR_MODE_OFF);
     lv_obj_remove_flag(home_pager_, LV_OBJ_FLAG_SCROLLABLE);
-
-    home_pager_track_ = lv_obj_create(home_pager_);
-    lv_obj_set_size(home_pager_track_, width_, 2);
-    lv_obj_set_style_radius(home_pager_track_, 0, 0);
-    lv_obj_set_style_bg_color(home_pager_track_, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_bg_opa(home_pager_track_, 14, 0);
-    lv_obj_set_style_border_width(home_pager_track_, 0, 0);
-    lv_obj_align(home_pager_track_, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-
-    home_pager_line_ = lv_obj_create(home_pager_);
-    lv_obj_set_size(home_pager_line_, width_ / home_pages_count_, 2);
-    lv_obj_set_style_radius(home_pager_line_, 0, 0);
-    lv_obj_set_style_bg_color(home_pager_line_, lv_color_hex(0x38e1f0), 0);
-    lv_obj_set_style_bg_opa(home_pager_line_, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(home_pager_line_, 0, 0);
-    lv_obj_set_style_shadow_width(home_pager_line_, 8, 0);
-    lv_obj_set_style_shadow_color(home_pager_line_, lv_color_hex(0x38e1f0), 0);
-    lv_obj_set_style_shadow_opa(home_pager_line_, 140, 0);
-    lv_obj_align(home_pager_line_, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-
-    home_page_label_ = lv_label_create(home_pager_);
-    lv_obj_set_style_text_color(home_page_label_, lv_color_hex(0x7c8bab), 0);
-    if (ui_font != nullptr) {
-        lv_obj_set_style_text_font(home_page_label_, ui_font, 0);
-    }
-    lv_obj_align(home_page_label_, LV_ALIGN_LEFT_MID, 11, -2);
+    lv_obj_remove_flag(home_pager_, LV_OBJ_FLAG_CLICKABLE);
 
     auto* dots = lv_obj_create(home_pager_);
     lv_obj_set_size(dots, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
@@ -924,26 +1072,32 @@ void HomePage::CreateLauncher(LvglTheme* theme) {
     lv_obj_set_style_bg_opa(dots, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(dots, 0, 0);
     lv_obj_set_style_pad_all(dots, 0, 0);
-    lv_obj_set_style_pad_column(dots, 5, 0);
-    lv_obj_align(dots, LV_ALIGN_CENTER, 0, -2);
+    lv_obj_set_style_pad_column(dots, 6, 0);
+    lv_obj_align(dots, LV_ALIGN_CENTER, 0, 0);
     lv_obj_remove_flag(dots, LV_OBJ_FLAG_SCROLLABLE);
     for (int i = 0; i < home_pages_count_; i++) {
         auto* dot = lv_obj_create(dots);
-        lv_obj_set_size(dot, i == 0 ? 14 : 4, 4);
+        lv_obj_set_size(dot, i == 0 ? 16 : 4, 4);
         lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(dot, i == 0 ? lv_color_hex(0x38e1f0) : lv_color_hex(0xffffff), 0);
+        lv_obj_set_style_bg_color(dot, i == 0 ? home_page_accents_[0] : lv_color_hex(0xffffff), 0);
         lv_obj_set_style_bg_opa(dot, i == 0 ? LV_OPA_COVER : 60, 0);
         lv_obj_set_style_border_width(dot, 0, 0);
+        // The dots are 4px wide; grow the touch target a little without
+        // changing the look (bigger values would make neighbours overlap).
+        lv_obj_set_ext_click_area(dot, 4);
         home_dots_.push_back(dot);
     }
-
-    auto* hint = lv_label_create(home_pager_);
-    lv_label_set_text(hint, "SWIPE »");
-    lv_obj_set_style_text_color(hint, lv_color_hex(0x687ba0), 0);
-    if (ui_font != nullptr) {
-        lv_obj_set_style_text_font(hint, ui_font, 0);
-    }
-    lv_obj_align(hint, LV_ALIGN_RIGHT_MID, -11, -2);
+    // Tapping a dot jumps to that page with the same slide as a swipe.
+    lv_obj_add_event_cb(
+        dots,
+        [](lv_event_t* e) {
+            auto* self = static_cast<HomePage*>(lv_event_get_user_data(e));
+            auto* target = static_cast<lv_obj_t*>(lv_event_get_target(e));
+            if (target != nullptr) {
+                self->GoToHomePage(lv_obj_get_index(target));
+            }
+        },
+        LV_EVENT_CLICKED, this);
 
     UpdateHomePageIndicator(0);
     UpdateStatusBarClock();
@@ -956,227 +1110,103 @@ void HomePage::CreateLauncher(LvglTheme* theme) {
     lv_timer_pause(home_clock_timer_);
 }
 
-void HomePage::CreateLauncherPage(const LauncherPageDef& pdef, int index, LvglTheme* theme) {
-    const lv_font_t* ui_font = &font_noto_sans_basic_14_1;
-    const lv_font_t* icon_font = theme != nullptr && theme->large_icon_font() != nullptr
-                                     ? theme->large_icon_font()->font()
-                                     : nullptr;
-    const int line_height = ui_font != nullptr ? ui_font->line_height : 16;
+void HomePage::CreateLauncherPage(const LauncherPageDef& pdef, int index) {
     const int status_h = std::max(18, height_ * kLauncherStatusPercent / 100);
     const int pager_h = std::max(22, height_ * kLauncherPagerPercent / 100);
-    const int launcher_h = height_ - status_h - pager_h;
-    const int head_h = std::max(20, launcher_h * kLauncherHeadPercent / 100);
-    const int grid_h = std::max(1, launcher_h - head_h);
-    const int page_pad = std::max(6, width_ * 2 / 100);
-    const int cell_gap = std::max(4, width_ * 2 / 100);
-    const int cell_w = std::max(1, (width_ - 2 * page_pad - 2 * cell_gap) / 3);
-    const int cell_h = std::max(1, (grid_h - 2 * page_pad - cell_gap) / 2);
-    int card_size = std::min(cell_w - 12, cell_h - line_height - 8);
-    card_size = std::max(24, std::min(card_size, 52));
+    const int page_h = height_ - status_h - pager_h;
+    int card_size = std::min(page_h * 56 / 100, width_ * 34 / 100);
+    card_size = std::max(48, card_size);
+    const int ring_radius = page_h * 48 / 100;
+    // Inactive pages stay browsable but read as clearly unavailable.
+    const uint32_t accent = pdef.enabled ? pdef.accent : 0x5a6a82;
+    const uint32_t accent2 = pdef.enabled ? pdef.accent2 : 0x3a465a;
+
+    auto* data = new AppClickData{this,   pdef.view, pdef.wake,   pdef.enabled, pdef.icon,
+                                  accent, accent2,   pdef.glow_a, pdef.glow_b};
+    home_click_data_.push_back(data);
 
     auto* page = lv_obj_create(home_tileview_);
-    lv_obj_set_size(page, width_, launcher_h);
+    lv_obj_set_size(page, width_, page_h);
     lv_obj_set_pos(page, index * width_, 0);
     lv_obj_set_style_radius(page, 0, 0);
     lv_obj_set_style_border_width(page, 0, 0);
     lv_obj_set_style_pad_all(page, 0, 0);
-    lv_obj_set_style_bg_color(page, TintColor(pdef.accent, 0x050810, 46), 0);
-    lv_obj_set_style_bg_grad_color(page, lv_color_hex(0x04060c), 0);
+    lv_obj_set_style_bg_color(page, TintColor(pdef.accent, 0x050810, 28), 0);
+    lv_obj_set_style_bg_grad_color(page, lv_color_hex(0x03050b), 0);
     lv_obj_set_style_bg_grad_dir(page, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_bg_opa(page, LV_OPA_COVER, 0);
     lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_OFF);
     lv_obj_remove_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(page, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(page, DrawLauncherBackground, LV_EVENT_DRAW_MAIN_END, data);
 
-    // Corner glows: two soft discs behind the grid, one per page color.
-    auto* glow_a = lv_obj_create(page);
-    lv_obj_set_size(glow_a, width_ * 66 / 100, launcher_h * 78 / 100);
-    lv_obj_set_pos(glow_a, -width_ * 18 / 100, -launcher_h * 42 / 100);
-    lv_obj_set_style_radius(glow_a, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(glow_a, 0, 0);
-    lv_obj_set_style_bg_color(glow_a, lv_color_hex(pdef.glow_a), 0);
-    lv_obj_set_style_bg_opa(glow_a, 26, 0);
-    lv_obj_set_style_shadow_width(glow_a, 60, 0);
-    lv_obj_set_style_shadow_color(glow_a, lv_color_hex(pdef.glow_a), 0);
-    lv_obj_set_style_shadow_opa(glow_a, 40, 0);
-    lv_obj_add_flag(glow_a, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_obj_remove_flag(glow_a, LV_OBJ_FLAG_CLICKABLE);
+    // Marker sitting on top of the orbit ring.
+    auto* orbit = lv_obj_create(page);
+    lv_obj_set_size(orbit, 6, 6);
+    lv_obj_set_style_radius(orbit, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(orbit, lv_color_hex(accent), 0);
+    lv_obj_set_style_bg_opa(orbit, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(orbit, 0, 0);
+    lv_obj_set_style_shadow_width(orbit, 10, 0);
+    lv_obj_set_style_shadow_color(orbit, lv_color_hex(accent), 0);
+    lv_obj_set_style_shadow_opa(orbit, 170, 0);
+    lv_obj_align(orbit, LV_ALIGN_TOP_MID, 0, page_h / 2 - ring_radius - 3);
+    lv_obj_remove_flag(orbit, LV_OBJ_FLAG_CLICKABLE);
 
-    auto* glow_b = lv_obj_create(page);
-    lv_obj_set_size(glow_b, width_ * 62 / 100, launcher_h * 70 / 100);
-    lv_obj_set_pos(glow_b, width_ - width_ * 52 / 100, launcher_h - launcher_h * 34 / 100);
-    lv_obj_set_style_radius(glow_b, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(glow_b, 0, 0);
-    lv_obj_set_style_bg_color(glow_b, lv_color_hex(pdef.glow_b), 0);
-    lv_obj_set_style_bg_opa(glow_b, 22, 0);
-    lv_obj_set_style_shadow_width(glow_b, 50, 0);
-    lv_obj_set_style_shadow_color(glow_b, lv_color_hex(pdef.glow_b), 0);
-    lv_obj_set_style_shadow_opa(glow_b, 34, 0);
-    lv_obj_add_flag(glow_b, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_obj_remove_flag(glow_b, LV_OBJ_FLAG_CLICKABLE);
+    /* ---------- 主图标 ---------- */
+    auto* card = lv_obj_create(page);
+    lv_obj_set_size(card, card_size, card_size);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(card, card_size * 28 / 100, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x2b2536), 0);
+    lv_obj_set_style_bg_grad_color(card, lv_color_hex(0x121019), 0);
+    lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_border_opa(card, pdef.enabled ? 120 : 55, 0);
+    lv_obj_set_style_shadow_width(card, card_size * 30 / 100, 0);
+    lv_obj_set_style_shadow_color(card, lv_color_hex(accent), 0);
+    lv_obj_set_style_shadow_opa(card, pdef.enabled ? 78 : 0, 0);
+    // Tactile press feedback: one small layer, only while a finger is down.
+    lv_obj_set_style_transform_scale(card, 244, LV_STATE_PRESSED);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(card, DrawLauncherIcon, LV_EVENT_DRAW_MAIN_END, data);
 
-    // Concentric ring, the "instrument" motif of the reference design.
-    auto* ring = lv_obj_create(page);
-    const int ring_size = launcher_h * 88 / 100;
-    lv_obj_set_size(ring, ring_size, ring_size);
-    lv_obj_set_pos(ring, width_ - ring_size * 66 / 100, launcher_h * 16 / 100);
-    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(ring, 1, 0);
-    lv_obj_set_style_border_color(ring, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_border_opa(ring, 18, 0);
-    lv_obj_add_flag(ring, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
+    // Glass highlight along the top edge of the tile.
+    auto* shine = lv_obj_create(card);
+    lv_obj_set_size(shine, card_size * 52 / 100, 1);
+    lv_obj_align(shine, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_radius(shine, 1, 0);
+    lv_obj_set_style_bg_color(shine, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_bg_opa(shine, 90, 0);
+    lv_obj_set_style_border_width(shine, 0, 0);
+    lv_obj_remove_flag(shine, LV_OBJ_FLAG_CLICKABLE);
 
-    /* ---------- 页头 ---------- */
-    auto* head = lv_obj_create(page);
-    lv_obj_set_size(head, width_, head_h);
-    lv_obj_set_pos(head, 0, 0);
-    lv_obj_set_style_bg_opa(head, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(head, 0, 0);
-    lv_obj_set_style_pad_left(head, 13, 0);
-    lv_obj_set_style_pad_right(head, 13, 0);
-    lv_obj_set_style_pad_top(head, 2, 0);
-    lv_obj_set_style_pad_bottom(head, 0, 0);
-    lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(head, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_remove_flag(head, LV_OBJ_FLAG_SCROLLABLE);
+    // Secondary accent dot in the bottom-right corner of the tile.
+    auto* dot = lv_obj_create(card);
+    lv_obj_set_size(dot, 6, 6);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(dot, lv_color_hex(accent2), 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(dot, 0, 0);
+    lv_obj_set_style_shadow_width(dot, 10, 0);
+    lv_obj_set_style_shadow_color(dot, lv_color_hex(accent2), 0);
+    lv_obj_set_style_shadow_opa(dot, 170, 0);
+    lv_obj_align(dot, LV_ALIGN_BOTTOM_RIGHT, -12, -12);
+    lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
 
-    auto* head_left = lv_obj_create(head);
-    lv_obj_set_size(head_left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(head_left, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(head_left, 0, 0);
-    lv_obj_set_style_pad_all(head_left, 0, 0);
-    lv_obj_set_style_pad_column(head_left, 8, 0);
-    lv_obj_set_flex_flow(head_left, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(head_left, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_remove_flag(head_left, LV_OBJ_FLAG_SCROLLABLE);
-
-    char number[16];
-    snprintf(number, sizeof(number), "%02d", index + 1);
-    auto* head_num = lv_label_create(head_left);
-    lv_label_set_text(head_num, number);
-    lv_obj_set_style_text_color(head_num, lv_color_hex(pdef.accent), 0);
-    if (ui_font != nullptr) {
-        lv_obj_set_style_text_font(head_num, ui_font, 0);
-    }
-
-    auto* head_title = lv_label_create(head_left);
-    lv_label_set_text(head_title, pdef.title);
-    lv_obj_set_style_text_color(head_title, lv_color_hex(0xf2f7ff), 0);
-    if (ui_font != nullptr) {
-        lv_obj_set_style_text_font(head_title, ui_font, 0);
-    }
-
-    auto* head_label = lv_label_create(head);
-    lv_label_set_text(head_label, pdef.label);
-    lv_obj_set_style_text_color(head_label, lv_color_hex(0x8292b0), 0);
-    lv_obj_set_style_text_letter_space(head_label, 1, 0);
-    lv_obj_set_style_transform_scale(head_label, 180, 0);
-    if (ui_font != nullptr) {
-        lv_obj_set_style_text_font(head_label, ui_font, 0);
-    }
-
-    /* ---------- 应用网格 ---------- */
-    auto* grid = lv_obj_create(page);
-    lv_obj_set_size(grid, width_, grid_h);
-    lv_obj_set_pos(grid, 0, head_h);
-    lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(grid, 0, 0);
-    lv_obj_set_style_pad_all(grid, page_pad, 0);
-    lv_obj_set_style_pad_row(grid, cell_gap, 0);
-    lv_obj_set_style_pad_column(grid, cell_gap, 0);
-    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_scrollbar_mode(grid, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
-
-    for (auto& app : pdef.apps) {
-        auto* cell = lv_obj_create(grid);
-        lv_obj_set_size(cell, cell_w, cell_h);
-        lv_obj_set_style_bg_opa(cell, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(cell, 0, 0);
-        lv_obj_set_style_pad_all(cell, 0, 0);
-        lv_obj_set_style_pad_row(cell, 5, 0);
-        lv_obj_set_flex_flow(cell, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(cell, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
-                              LV_FLEX_ALIGN_CENTER);
-        lv_obj_remove_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
-
-        auto* card = lv_obj_create(cell);
-        lv_obj_set_size(card, card_size, card_size);
-        lv_obj_set_style_radius(card, card_size * 30 / 100, 0);
-        lv_obj_set_style_pad_all(card, 0, 0);
-        lv_obj_set_style_bg_color(card, lv_color_hex(0x1d2735), 0);
-        lv_obj_set_style_bg_grad_color(card, lv_color_hex(0x0d131c), 0);
-        lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
-        lv_obj_set_style_bg_opa(card, 232, 0);
-        lv_obj_set_style_border_width(card, 1, 0);
-        lv_obj_set_style_border_color(card, lv_color_hex(0xffffff), 0);
-        lv_obj_set_style_border_opa(card, 34, 0);
-        lv_obj_set_style_shadow_width(card, card_size * 40 / 100, 0);
-        lv_obj_set_style_shadow_offset_y(card, 2, 0);
-        lv_obj_set_style_shadow_color(card, lv_color_hex(app.icon_color), 0);
-        lv_obj_set_style_shadow_opa(card, 72, 0);
-        lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-        if (!app.enabled) {
-            // Reserved entries stay visible but clearly inactive.
-            lv_obj_set_style_opa(card, 140, 0);
-            lv_obj_remove_flag(card, LV_OBJ_FLAG_CLICKABLE);
-        }
-
-        // Glass highlight along the top edge.
-        auto* shine = lv_obj_create(card);
-        lv_obj_set_size(shine, card_size * 62 / 100, 1);
-        lv_obj_align(shine, LV_ALIGN_TOP_MID, 0, 3);
-        lv_obj_set_style_radius(shine, 1, 0);
-        lv_obj_set_style_bg_color(shine, lv_color_hex(0xffffff), 0);
-        lv_obj_set_style_bg_opa(shine, 70, 0);
-        lv_obj_set_style_border_width(shine, 0, 0);
-        lv_obj_remove_flag(shine, LV_OBJ_FLAG_CLICKABLE);
-
-        auto* ico = lv_label_create(card);
-        lv_label_set_text(ico, app.icon);
-        lv_obj_set_style_text_color(ico, lv_color_hex(app.icon_color), 0);
-        if (icon_font != nullptr) {
-            lv_obj_set_style_text_font(ico, icon_font, 0);
-        }
-        lv_obj_center(ico);
-        home_app_icons_.push_back(ico);
-
-        auto* dot = lv_obj_create(card);
-        lv_obj_set_size(dot, 4, 4);
-        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(dot, lv_color_hex(app.dot_color), 0);
-        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(dot, 0, 0);
-        lv_obj_set_style_shadow_width(dot, 6, 0);
-        lv_obj_set_style_shadow_color(dot, lv_color_hex(app.dot_color), 0);
-        lv_obj_set_style_shadow_opa(dot, 160, 0);
-        lv_obj_align(dot, LV_ALIGN_BOTTOM_RIGHT, -6, -6);
-        lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
-
-        auto* name = lv_label_create(cell);
-        lv_label_set_text(name, app.name);
-        lv_obj_set_style_text_color(name, lv_color_hex(app.enabled ? 0xc9d7ee : 0x7c8bab), 0);
-        lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
-        if (ui_font != nullptr) {
-            lv_obj_set_style_text_font(name, ui_font, 0);
-        }
-
-        if (app.enabled) {
-            lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
-            auto* cd = new AppClickData{this, app.view, app.wake};
-            home_click_data_.push_back(cd);
-            lv_obj_add_event_cb(
-                card,
-                [](lv_event_t* e) {
-                    auto* d = static_cast<AppClickData*>(lv_event_get_user_data(e));
-                    d->self->RequestView(d->view, d->wake);
-                },
-                LV_EVENT_CLICKED, cd);
-        }
+    if (pdef.enabled) {
+        lv_obj_add_event_cb(
+            card,
+            [](lv_event_t* e) {
+                auto* d = static_cast<AppClickData*>(lv_event_get_user_data(e));
+                d->self->RequestView(d->view, d->wake);
+            },
+            LV_EVENT_CLICKED, data);
+    } else {
+        lv_obj_remove_flag(card, LV_OBJ_FLAG_CLICKABLE);
     }
 }
 
@@ -1295,13 +1325,6 @@ void HomePage::ApplyTheme(LvglTheme* theme) {
             lv_obj_set_style_text_font(label, icon_font, 0);
         }
     }
-    // Launcher tiles use the larger glyph face so the icons fill the glass tile.
-    if (theme->large_icon_font() != nullptr && theme->large_icon_font()->font() != nullptr) {
-        auto* large_icon_font = theme->large_icon_font()->font();
-        for (auto* label : home_app_icons_) {
-            lv_obj_set_style_text_font(label, large_icon_font, 0);
-        }
-    }
 }
 
 void HomePage::OnHomeScroll(lv_event_t* e) {
@@ -1315,33 +1338,28 @@ void HomePage::OnHomeScroll(lv_event_t* e) {
     UpdateHomePageIndicator(page);
 }
 
-void HomePage::UpdateHomePageIndicator(int page) {
-    if (home_page_label_ != nullptr && page >= 0 &&
-        page < static_cast<int>(home_page_titles_.size())) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%02d / %02d · %s", page + 1, home_pages_count_,
-                 home_page_titles_[page].c_str());
-        lv_label_set_text(home_page_label_, buf);
+void HomePage::GoToHomePage(int page) {
+    if (home_tileview_ == nullptr || home_pages_count_ <= 0) {
+        return;
     }
+    page = std::max(0, std::min(home_pages_count_ - 1, page));
+    lv_obj_scroll_to_x(home_tileview_, -page * width_, LV_ANIM_ON);
+    UpdateHomePageIndicator(page);
+}
+
+void HomePage::UpdateHomePageIndicator(int page) {
     const lv_color_t accent = page >= 0 && page < static_cast<int>(home_page_accents_.size())
                                   ? home_page_accents_[page]
                                   : lv_color_hex(0x38e1f0);
     for (size_t i = 0; i < home_dots_.size(); i++) {
         lv_obj_t* dot = home_dots_[i];
         const bool on = static_cast<int>(i) == page;
-        lv_obj_set_size(dot, on ? 14 : 4, 4);
+        lv_obj_set_size(dot, on ? 16 : 4, 4);
         lv_obj_set_style_bg_color(dot, on ? accent : lv_color_hex(0xffffff), 0);
         lv_obj_set_style_bg_opa(dot, on ? LV_OPA_COVER : 60, 0);
         lv_obj_set_style_shadow_color(dot, accent, 0);
-        lv_obj_set_style_shadow_width(dot, on ? 8 : 0, 0);
-        lv_obj_set_style_shadow_opa(dot, on ? 140 : 0, 0);
-    }
-    if (home_pager_line_ != nullptr && home_pages_count_ > 0) {
-        const int seg = width_ / home_pages_count_;
-        lv_obj_set_size(home_pager_line_, seg, 2);
-        lv_obj_set_style_bg_color(home_pager_line_, accent, 0);
-        lv_obj_set_style_shadow_color(home_pager_line_, accent, 0);
-        lv_obj_align(home_pager_line_, LV_ALIGN_BOTTOM_LEFT, page * seg, 0);
+        lv_obj_set_style_shadow_width(dot, on ? 10 : 0, 0);
+        lv_obj_set_style_shadow_opa(dot, on ? 150 : 0, 0);
     }
 }
 
