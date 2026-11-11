@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <string>
@@ -47,6 +48,9 @@ struct AppClickData {
     uint32_t accent2;
     uint32_t glow_a;
     uint32_t glow_b;
+    // Points at HomePage::home_fast_draw_; while a swipe is in flight the page
+    // background skips the grid and the dashed ring.
+    bool* fast_draw;
 };
 // Capture() itself blocks on the sensor and the LVGL lock, so this is only a
 // ceiling on how often the preview task wakes up, not a fixed frame interval.
@@ -242,6 +246,18 @@ constexpr int kLauncherStatusPercent = 9;
 constexpr int kLauncherPagerPercent = 11;
 constexpr int kLauncherClockIntervalMs = 5000;
 
+// Same numbers as the reference prototype: 460ms ease-out to the next page,
+// 45px / 0.45px-per-ms flick threshold, 0.35x resistance past the edge.
+constexpr int kSwipeAnimMs = 460;
+constexpr int kSwipeMinAnimMs = 140;
+constexpr int kSwipeThresholdPx = 45;
+constexpr int kSwipeFlickX1000 = 450;
+constexpr int kSwipeEdgeDamping = 35;
+constexpr int kSwipeMoveSlopPx = 4;
+constexpr int kPagerSlotPx = 16;
+constexpr int kPagerPillWidth = 16;
+constexpr int kPagerDotWidth = 4;
+
 // Blend `rgb` toward `base`: 0 keeps base, 255 keeps rgb.
 lv_color_t TintColor(uint32_t rgb, uint32_t base, uint8_t amount) {
     auto mix = [amount](uint32_t color, uint32_t back) {
@@ -289,6 +305,18 @@ void DrawLauncherBackground(lv_event_t* e) {
     const int32_t w = lv_area_get_width(&coords);
     const int32_t h = lv_area_get_height(&coords);
 
+    const int32_t cx = coords.x1 + w / 2;
+    const int32_t cy = coords.y1 + h / 2;
+    DrawLauncherWash(layer, coords.x1 + w * 4 / 100, cy - h * 12 / 100, h * 66 / 100, data->glow_a);
+    DrawLauncherWash(layer, coords.x2 - w * 4 / 100, cy + h * 26 / 100, h * 58 / 100, data->glow_b);
+
+    // The grid and the dashed ring are pure decoration. Skipping them during a
+    // swipe removes ~60 line draw tasks per page per frame; they come back on
+    // the first idle redraw, when the eye can actually see them.
+    if (data->fast_draw != nullptr && *data->fast_draw) {
+        return;
+    }
+
     lv_draw_line_dsc_t line_dsc;
     lv_draw_line_dsc_init(&line_dsc);
     line_dsc.color = lv_color_white();
@@ -308,11 +336,6 @@ void DrawLauncherBackground(lv_event_t* e) {
         line_dsc.p2.y = y;
         lv_draw_line(layer, &line_dsc);
     }
-
-    const int32_t cx = coords.x1 + w / 2;
-    const int32_t cy = coords.y1 + h / 2;
-    DrawLauncherWash(layer, coords.x1 + w * 4 / 100, cy - h * 12 / 100, h * 66 / 100, data->glow_a);
-    DrawLauncherWash(layer, coords.x2 - w * 4 / 100, cy + h * 26 / 100, h * 58 / 100, data->glow_b);
 
     // Dashed orbit ring around the hero tile.
     const int32_t radius = h * 48 / 100;
@@ -453,6 +476,8 @@ HomePage::HomePage(Display* display, int width, int height, LvglTheme* theme)
 HomePage::~HomePage() {
     // Make any already queued UI callbacks no-ops before the LVGL objects go.
     view_.store(HomePageView::kAiChat);
+    // The swipe animation holds `this` as its var; it must not outlive us.
+    lv_anim_delete(this, &HomePage::SwipeAnimExec);
     if (hint_timer_ != nullptr) {
         lv_timer_delete(hint_timer_);
         hint_timer_ = nullptr;
@@ -1015,19 +1040,6 @@ void HomePage::CreateLauncher(LvglTheme* theme) {
     }
 
     /* ---------- 单页单图标 ---------- */
-    home_tileview_ = lv_obj_create(home_root_);
-    lv_obj_set_size(home_tileview_, width_, page_h);
-    lv_obj_set_style_radius(home_tileview_, 0, 0);
-    lv_obj_set_style_bg_opa(home_tileview_, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(home_tileview_, 0, 0);
-    lv_obj_set_style_pad_all(home_tileview_, 0, 0);
-    lv_obj_set_scroll_dir(home_tileview_, LV_DIR_HOR);
-    lv_obj_set_scrollbar_mode(home_tileview_, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_set_scroll_snap_x(home_tileview_, LV_SCROLL_SNAP_CENTER);
-    // Rubber band at both ends, like the reference prototype's 0.35x damping.
-    lv_obj_add_flag(home_tileview_, LV_OBJ_FLAG_SCROLL_ELASTIC);
-    lv_obj_remove_flag(home_tileview_, LV_OBJ_FLAG_CLICKABLE);
-
     // One feature per page, ordered by how often it is used; the colours follow
     // the prototype's per-page accent pairs.
     std::vector<LauncherPageDef> pages = {
@@ -1040,21 +1052,47 @@ void HomePage::CreateLauncher(LvglTheme* theme) {
         {LauncherIcon::kGallery, 0xfbbf24, 0xfde68a, 0xf59e0b, 0xfb7185, kGalleryEnabled,
          HomePageView::kGallery, false},
     };
-
     home_pages_count_ = static_cast<int>(pages.size());
     for (auto& pdef : pages) {
         home_page_accents_.push_back(lv_color_hex(pdef.accent));
     }
+
+    // No LVGL scroll/throw/snap here. We translate a single track ourselves,
+    // so one gesture can never fling over several apps at once.
+    home_tileview_ = lv_obj_create(home_root_);
+    lv_obj_set_size(home_tileview_, width_, page_h);
+    lv_obj_set_style_radius(home_tileview_, 0, 0);
+    lv_obj_set_style_bg_opa(home_tileview_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(home_tileview_, 0, 0);
+    lv_obj_set_style_pad_all(home_tileview_, 0, 0);
+    lv_obj_set_scrollbar_mode(home_tileview_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(home_tileview_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(home_tileview_, LV_OBJ_FLAG_CLICKABLE);
+
+    home_pages_track_ = lv_obj_create(home_tileview_);
+    lv_obj_set_size(home_pages_track_, width_ * home_pages_count_, page_h);
+    lv_obj_set_pos(home_pages_track_, 0, 0);
+    lv_obj_set_style_bg_opa(home_pages_track_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(home_pages_track_, 0, 0);
+    lv_obj_set_style_pad_all(home_pages_track_, 0, 0);
+    lv_obj_remove_flag(home_pages_track_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(home_pages_track_, LV_OBJ_FLAG_EVENT_BUBBLE);
+
     for (size_t i = 0; i < pages.size(); i++) {
         CreateLauncherPage(pages[i], static_cast<int>(i));
     }
 
-    lv_obj_add_event_cb(
-        home_tileview_,
-        [](lv_event_t* e) { static_cast<HomePage*>(lv_event_get_user_data(e))->OnHomeScroll(e); },
-        LV_EVENT_SCROLL_END, this);
+    for (auto code :
+         {LV_EVENT_PRESSED, LV_EVENT_PRESSING, LV_EVENT_RELEASED, LV_EVENT_PRESS_LOST}) {
+        lv_obj_add_event_cb(
+            home_tileview_,
+            [](lv_event_t* e) {
+                static_cast<HomePage*>(lv_event_get_user_data(e))->OnLauncherGesture(e);
+            },
+            code, this);
+    }
 
-    /* ---------- 页码点 ---------- */
+    /* ---------- 页码滑块 ---------- */
     home_pager_ = lv_obj_create(home_root_);
     lv_obj_set_size(home_pager_, width_, pager_h);
     lv_obj_set_style_radius(home_pager_, 0, 0);
@@ -1065,41 +1103,56 @@ void HomePage::CreateLauncher(LvglTheme* theme) {
     lv_obj_remove_flag(home_pager_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(home_pager_, LV_OBJ_FLAG_CLICKABLE);
 
-    auto* dots = lv_obj_create(home_pager_);
-    lv_obj_set_size(dots, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(dots, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(dots, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_bg_opa(dots, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(dots, 0, 0);
-    lv_obj_set_style_pad_all(dots, 0, 0);
-    lv_obj_set_style_pad_column(dots, 6, 0);
-    lv_obj_align(dots, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_remove_flag(dots, LV_OBJ_FLAG_SCROLLABLE);
+    // Fixed slots plus one floating pill. The pill's x is interpolated from the
+    // track position, so it moves with the finger instead of jumping on release.
+    home_pager_dots_ = lv_obj_create(home_pager_);
+    lv_obj_set_size(home_pager_dots_, home_pages_count_ * kPagerSlotPx, kPagerDotWidth);
+    lv_obj_align(home_pager_dots_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_opa(home_pager_dots_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(home_pager_dots_, 0, 0);
+    lv_obj_set_style_pad_all(home_pager_dots_, 0, 0);
+    lv_obj_remove_flag(home_pager_dots_, LV_OBJ_FLAG_SCROLLABLE);
     for (int i = 0; i < home_pages_count_; i++) {
-        auto* dot = lv_obj_create(dots);
-        lv_obj_set_size(dot, i == 0 ? 16 : 4, 4);
+        auto* dot = lv_obj_create(home_pager_dots_);
+        lv_obj_set_size(dot, kPagerDotWidth, kPagerDotWidth);
+        lv_obj_set_pos(dot, i * kPagerSlotPx + (kPagerSlotPx - kPagerDotWidth) / 2, 0);
         lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(dot, i == 0 ? home_page_accents_[0] : lv_color_hex(0xffffff), 0);
-        lv_obj_set_style_bg_opa(dot, i == 0 ? LV_OPA_COVER : 60, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(0xffffff), 0);
+        lv_obj_set_style_bg_opa(dot, 60, 0);
         lv_obj_set_style_border_width(dot, 0, 0);
-        // The dots are 4px wide; grow the touch target a little without
-        // changing the look (bigger values would make neighbours overlap).
-        lv_obj_set_ext_click_area(dot, 4);
+        // A slot-wide touch target: neighbours do not overlap.
+        lv_obj_set_ext_click_area(dot, 5);
+        // The tap handler lives on the row, so let the event bubble up.
+        lv_obj_add_flag(dot, LV_OBJ_FLAG_EVENT_BUBBLE);
         home_dots_.push_back(dot);
     }
-    // Tapping a dot jumps to that page with the same slide as a swipe.
+
+    home_pager_pill_ = lv_obj_create(home_pager_dots_);
+    lv_obj_set_size(home_pager_pill_, kPagerPillWidth, kPagerDotWidth);
+    lv_obj_set_pos(home_pager_pill_, 0, 0);
+    lv_obj_set_style_radius(home_pager_pill_, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(home_pager_pill_, home_page_accents_[0], 0);
+    lv_obj_set_style_bg_opa(home_pager_pill_, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(home_pager_pill_, 0, 0);
+    lv_obj_set_style_shadow_width(home_pager_pill_, 10, 0);
+    lv_obj_set_style_shadow_color(home_pager_pill_, home_page_accents_[0], 0);
+    lv_obj_set_style_shadow_opa(home_pager_pill_, 150, 0);
+    lv_obj_remove_flag(home_pager_pill_, LV_OBJ_FLAG_CLICKABLE);
+
+    // Tapping a slot jumps to that page with the same slide as a swipe.
     lv_obj_add_event_cb(
-        dots,
+        home_pager_dots_,
         [](lv_event_t* e) {
             auto* self = static_cast<HomePage*>(lv_event_get_user_data(e));
             auto* target = static_cast<lv_obj_t*>(lv_event_get_target(e));
-            if (target != nullptr) {
-                self->GoToHomePage(lv_obj_get_index(target));
+            const int index = target != nullptr ? static_cast<int>(lv_obj_get_index(target)) : 0;
+            if (index >= 0 && index < self->home_pages_count_) {
+                self->GoToHomePage(index);
             }
         },
         LV_EVENT_CLICKED, this);
 
-    UpdateHomePageIndicator(0);
+    SetSwipePosition(0);
     UpdateStatusBarClock();
 
     home_clock_timer_ = lv_timer_create(
@@ -1122,10 +1175,10 @@ void HomePage::CreateLauncherPage(const LauncherPageDef& pdef, int index) {
     const uint32_t accent2 = pdef.enabled ? pdef.accent2 : 0x3a465a;
 
     auto* data = new AppClickData{this,   pdef.view, pdef.wake,   pdef.enabled, pdef.icon,
-                                  accent, accent2,   pdef.glow_a, pdef.glow_b};
+                                  accent, accent2,   pdef.glow_a, pdef.glow_b,  &home_fast_draw_};
     home_click_data_.push_back(data);
 
-    auto* page = lv_obj_create(home_tileview_);
+    auto* page = lv_obj_create(home_pages_track_);
     lv_obj_set_size(page, width_, page_h);
     lv_obj_set_pos(page, index * width_, 0);
     lv_obj_set_style_radius(page, 0, 0);
@@ -1138,6 +1191,8 @@ void HomePage::CreateLauncherPage(const LauncherPageDef& pdef, int index) {
     lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_OFF);
     lv_obj_remove_flag(page, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(page, LV_OBJ_FLAG_CLICKABLE);
+    // Let press events bubble from the hero tile up to the gesture handler.
+    lv_obj_add_flag(page, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_add_event_cb(page, DrawLauncherBackground, LV_EVENT_DRAW_MAIN_END, data);
 
     // Marker sitting on top of the orbit ring.
@@ -1172,6 +1227,7 @@ void HomePage::CreateLauncherPage(const LauncherPageDef& pdef, int index) {
     // Tactile press feedback: one small layer, only while a finger is down.
     lv_obj_set_style_transform_scale(card, 244, LV_STATE_PRESSED);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_add_event_cb(card, DrawLauncherIcon, LV_EVENT_DRAW_MAIN_END, data);
 
     // Glass highlight along the top edge of the tile.
@@ -1202,6 +1258,10 @@ void HomePage::CreateLauncherPage(const LauncherPageDef& pdef, int index) {
             card,
             [](lv_event_t* e) {
                 auto* d = static_cast<AppClickData*>(lv_event_get_user_data(e));
+                // A drag that started on this tile must never open the app.
+                if (d->self->home_suppress_click_) {
+                    return;
+                }
                 d->self->RequestView(d->view, d->wake);
             },
             LV_EVENT_CLICKED, data);
@@ -1327,42 +1387,155 @@ void HomePage::ApplyTheme(LvglTheme* theme) {
     }
 }
 
-void HomePage::OnHomeScroll(lv_event_t* e) {
-    (void)e;
-    if (home_tileview_ == nullptr || home_pages_count_ <= 0) {
+void HomePage::SetSwipePosition(int track_x) {
+    if (home_pages_track_ != nullptr) {
+        lv_obj_set_x(home_pages_track_, track_x);
+    }
+    if (home_pager_pill_ == nullptr || width_ <= 0) {
         return;
     }
-    int scroll = lv_obj_get_scroll_x(home_tileview_);
-    int page = (-scroll + width_ / 2) / width_;
-    page = std::max(0, std::min(home_pages_count_ - 1, page));
-    UpdateHomePageIndicator(page);
+
+    // One slot per page, interpolated from the real track position, so the pill
+    // follows the finger during the drag and the easing animation alike.
+    lv_obj_set_x(home_pager_pill_, (-track_x) * kPagerSlotPx / width_);
+
+    if (!home_page_accents_.empty()) {
+        const int progress = std::max(0, (-track_x) * 1000 / width_);
+        const int page0 = std::min(home_pages_count_ - 1, progress / 1000);
+        const int page1 = std::min(home_pages_count_ - 1, page0 + 1);
+        const int ratio = std::min(255, (progress - page0 * 1000) * 255 / 1000);
+        const lv_color_t color = lv_color_mix(home_page_accents_[page1], home_page_accents_[page0],
+                                              static_cast<uint8_t>(ratio));
+        lv_obj_set_style_bg_color(home_pager_pill_, color, 0);
+        lv_obj_set_style_shadow_color(home_pager_pill_, color, 0);
+    }
 }
 
-void HomePage::GoToHomePage(int page) {
-    if (home_tileview_ == nullptr || home_pages_count_ <= 0) {
+void HomePage::AnimateToPage(int page, uint32_t duration_ms) {
+    if (home_pages_track_ == nullptr || home_pages_count_ <= 0) {
         return;
     }
     page = std::max(0, std::min(home_pages_count_ - 1, page));
-    lv_obj_scroll_to_x(home_tileview_, -page * width_, LV_ANIM_ON);
-    UpdateHomePageIndicator(page);
+    home_current_page_ = page;
+    const int from_x = lv_obj_get_x(home_pages_track_);
+    const int distance = std::abs(-page * width_ - from_x);
+    if (distance == 0) {
+        home_fast_draw_ = false;
+        lv_obj_invalidate(home_tileview_);
+        return;
+    }
+
+    // Ease-out quint is the LVGL equivalent of cubic-bezier(.22, 1, .36, 1).
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, this);
+    lv_anim_set_exec_cb(&anim, &HomePage::SwipeAnimExec);
+    lv_anim_set_values(&anim, from_x, -page * width_);
+    lv_anim_set_duration(&anim, duration_ms);
+    lv_anim_set_path_cb(&anim, lv_anim_path_custom_bezier3);
+    LV_ANIM_SET_EASE_OUT_QUINT(&anim);
+    lv_anim_set_completed_cb(&anim, &HomePage::SwipeAnimCompleted);
+    home_fast_draw_ = true;
+    lv_anim_start(&anim);
 }
 
-void HomePage::UpdateHomePageIndicator(int page) {
-    const lv_color_t accent = page >= 0 && page < static_cast<int>(home_page_accents_.size())
-                                  ? home_page_accents_[page]
-                                  : lv_color_hex(0x38e1f0);
-    for (size_t i = 0; i < home_dots_.size(); i++) {
-        lv_obj_t* dot = home_dots_[i];
-        const bool on = static_cast<int>(i) == page;
-        lv_obj_set_size(dot, on ? 16 : 4, 4);
-        lv_obj_set_style_bg_color(dot, on ? accent : lv_color_hex(0xffffff), 0);
-        lv_obj_set_style_bg_opa(dot, on ? LV_OPA_COVER : 60, 0);
-        lv_obj_set_style_shadow_color(dot, accent, 0);
-        lv_obj_set_style_shadow_width(dot, on ? 10 : 0, 0);
-        lv_obj_set_style_shadow_opa(dot, on ? 150 : 0, 0);
+void HomePage::SwipeAnimExec(void* var, int32_t value) {
+    static_cast<HomePage*>(var)->SetSwipePosition(static_cast<int>(value));
+}
+
+void HomePage::SwipeAnimCompleted(lv_anim_t* anim) {
+    auto* self = static_cast<HomePage*>(anim->var);
+    self->home_fast_draw_ = false;
+    self->home_suppress_click_ = false;
+    // Bring back the grid and dashed ring on the first idle frame.
+    lv_obj_invalidate(self->home_tileview_);
+}
+
+void HomePage::GoToHomePage(int page) { AnimateToPage(page, kSwipeAnimMs); }
+
+void HomePage::OnLauncherGesture(lv_event_t* e) {
+    if (home_pages_track_ == nullptr || home_pages_count_ <= 0) {
+        return;
+    }
+    lv_indev_t* indev = lv_event_get_indev(e);
+    if (indev == nullptr) {
+        indev = lv_indev_active();
+    }
+    if (indev == nullptr) {
+        return;
+    }
+
+    switch (lv_event_get_code(e)) {
+        case LV_EVENT_PRESSED: {
+            // Take over from an in-flight animation without jumping.
+            lv_anim_delete(this, &HomePage::SwipeAnimExec);
+            home_fast_draw_ = true;
+            home_swipe_active_ = true;
+            home_swipe_moved_ = false;
+            home_suppress_click_ = false;
+            home_swipe_dx_ = 0;
+            home_swipe_start_tick_ = lv_tick_get();
+            home_swipe_base_x_ = lv_obj_get_x(home_pages_track_);
+            lv_point_t point;
+            lv_indev_get_point(indev, &point);
+            home_swipe_start_point_ = point.x;
+            home_anchor_page_ = std::max(
+                0, std::min(home_pages_count_ - 1, (-home_swipe_base_x_ + width_ / 2) / width_));
+            break;
+        }
+        case LV_EVENT_PRESSING: {
+            if (!home_swipe_active_) {
+                break;
+            }
+            lv_point_t point;
+            lv_indev_get_point(indev, &point);
+            const int dx = point.x - home_swipe_start_point_;
+            home_swipe_dx_ = dx;
+            if (std::abs(dx) > kSwipeMoveSlopPx) {
+                home_swipe_moved_ = true;
+            }
+            // Only the adjacent pages are reachable: one gesture == one step.
+            const int min_x = -(home_pages_count_ - 1) * width_;
+            const int low = std::max(min_x, -(home_anchor_page_ + 1) * width_);
+            const int high = std::min(0, -(home_anchor_page_ - 1) * width_);
+            int x = home_swipe_base_x_ + dx;
+            if (x > high) {
+                x = high + (x - high) * kSwipeEdgeDamping / 100;
+            } else if (x < low) {
+                x = low + (x - low) * kSwipeEdgeDamping / 100;
+            }
+            SetSwipePosition(x);
+            break;
+        }
+        case LV_EVENT_RELEASED:
+        case LV_EVENT_PRESS_LOST: {
+            if (!home_swipe_active_) {
+                break;
+            }
+            home_swipe_active_ = false;
+            const uint32_t elapsed = std::max<uint32_t>(1, lv_tick_elaps(home_swipe_start_tick_));
+            const int dx = home_swipe_dx_;
+            const int flick_x1000 = std::abs(dx) * 1000 / static_cast<int>(elapsed);
+            const bool dragged = home_swipe_moved_ && lv_event_get_code(e) == LV_EVENT_RELEASED;
+            // CLICKED is emitted right after RELEASED, so suppress it here.
+            home_suppress_click_ = dragged;
+            const bool flick = std::abs(dx) >= kSwipeThresholdPx || flick_x1000 >= kSwipeFlickX1000;
+            const int step = dragged && flick ? (dx < 0 ? 1 : -1) : 0;
+            const int target =
+                std::max(0, std::min(home_pages_count_ - 1, home_anchor_page_ + step));
+            const int now_x = lv_obj_get_x(home_pages_track_);
+            const int distance = std::abs(-target * width_ - now_x);
+            const uint32_t duration =
+                std::max(static_cast<uint32_t>(kSwipeMinAnimMs),
+                         std::min(static_cast<uint32_t>(kSwipeAnimMs),
+                                  static_cast<uint32_t>(kSwipeAnimMs * distance / width_)));
+            AnimateToPage(target, duration);
+            break;
+        }
+        default:
+            break;
     }
 }
-
 void HomePage::RequestView(HomePageView view, bool wake_ai) {
     if (view == HomePageView::kGallery) {
         // The gallery's back button returns to whichever page opened it.

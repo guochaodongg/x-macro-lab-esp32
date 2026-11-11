@@ -82,9 +82,16 @@ private:
     lv_obj_t* CreateButton(lv_obj_t* parent, const char* text, int width, int height);
     lv_obj_t* CreateIconButton(lv_obj_t* parent, const char* icon, int size);
     void RequestView(HomePageView view, bool wake_ai);
-    void OnHomeScroll(lv_event_t* e);
+
+    // Launcher paging is driven by our own gesture handler instead of LVGL's
+    // scroll/throw/snap: one gesture can only move one page, and the pager pill
+    // follows the finger continuously.
+    void OnLauncherGesture(lv_event_t* e);
+    void SetSwipePosition(int track_x);
+    void AnimateToPage(int page, uint32_t duration_ms);
     void GoToHomePage(int page);
-    void UpdateHomePageIndicator(int page);
+    static void SwipeAnimExec(void* var, int32_t value);
+    static void SwipeAnimCompleted(lv_anim_t* anim);
     void CapturePhoto();
     void SetCaptureIcon(const char* icon);
     void StartWorker();
@@ -137,12 +144,26 @@ private:
     lv_obj_t* home_battery_label_ = nullptr;
     lv_obj_t* home_battery_pct_ = nullptr;
     lv_obj_t* home_tileview_ = nullptr;
+    lv_obj_t* home_pages_track_ = nullptr;
     lv_obj_t* home_pager_ = nullptr;
+    lv_obj_t* home_pager_dots_ = nullptr;
+    lv_obj_t* home_pager_pill_ = nullptr;
     lv_obj_t* home_button_ = nullptr;
     lv_timer_t* home_clock_timer_ = nullptr;
     std::vector<lv_obj_t*> home_dots_;
     std::vector<lv_color_t> home_page_accents_;
     int home_pages_count_ = 0;
+    int home_current_page_ = 0;
+    int home_anchor_page_ = 0;
+    int home_swipe_base_x_ = 0;
+    int home_swipe_start_point_ = 0;
+    int home_swipe_dx_ = 0;
+    uint32_t home_swipe_start_tick_ = 0;
+    bool home_swipe_active_ = false;
+    bool home_swipe_moved_ = false;
+    bool home_suppress_click_ = false;
+    // While dragging / animating, the page background skips its grid and ring.
+    bool home_fast_draw_ = false;
     std::vector<void*> home_click_data_;
     // Where the gallery's back button returns to: the launcher when it was
     // opened from the app pages, the camera page when it was opened from there.
