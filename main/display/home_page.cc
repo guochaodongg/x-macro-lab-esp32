@@ -576,10 +576,13 @@ void HomePage::CreateUi(LvglTheme* theme) {
     preview_width_ = width_;
     preview_height_ = height_;
     const int icon_vertical_offset = std::max(0, (shutter_size - icon_size) / 2);
-    // The file caption sits at the top center; playback progress and its timer
-    // sit at the bottom center, clear of the volume buttons in both corners.
-    const int info_top = margin + icon_size + 4;
-    const int info_width = preview_width_ * 80 / 100;
+    // The caption and the top-row icon buttons share the very first row. Keep
+    // the buttons flush with the top edge and reserve their width on both sides
+    // so the centred caption never runs underneath an icon. Playback progress
+    // and its timer sit at the bottom center, clear of the volume buttons.
+    const int caption_top = margin + 2;
+    const int top_row_side = margin + 2 + 2 * icon_size + 4;
+    const int info_width = std::max(icon_size, preview_width_ - 2 * top_row_side);
     const int progress_width = preview_width_ * 60 / 100;
     const int progress_bottom = margin + 2;
 
@@ -622,16 +625,22 @@ void HomePage::CreateUi(LvglTheme* theme) {
     gallery_info_ = lv_label_create(gallery_root_);
     lv_label_set_text(gallery_info_, Lang::Strings::GALLERY_LOADING);
     lv_obj_set_width(gallery_info_, info_width);
-    lv_label_set_long_mode(gallery_info_, LV_LABEL_LONG_CLIP);
+    // The centred column is narrower, so wrap long status strings instead of
+    // clipping them on small screens.
+    lv_label_set_long_mode(gallery_info_, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(gallery_info_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_bg_opa(gallery_info_, LV_OPA_70, 0);
     lv_obj_set_style_pad_all(gallery_info_, 2, 0);
     lv_obj_set_style_radius(gallery_info_, 4, 0);
     // 256 is 100%; shrink the glyphs without needing an extra font asset.
+    // Pin the scale pivot to the top-centre: with the default pivot the scaled
+    // caption drifts away from the top-middle position it is aligned to.
+    lv_obj_set_style_transform_pivot_x(gallery_info_, info_width / 2, 0);
+    lv_obj_set_style_transform_pivot_y(gallery_info_, 0, 0);
     lv_obj_set_style_transform_scale(gallery_info_, 190, 0);
-    lv_obj_align(gallery_info_, LV_ALIGN_TOP_MID, 0, info_top);
+    lv_obj_align(gallery_info_, LV_ALIGN_TOP_MID, 0, caption_top);
     gallery_back_button_ = CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_ARROW_BACK, icon_size);
-    lv_obj_align(gallery_back_button_, LV_ALIGN_TOP_LEFT, margin + 2, margin + 2);
+    lv_obj_align(gallery_back_button_, LV_ALIGN_TOP_LEFT, margin + 2, caption_top);
     gallery_prev_button_ =
         CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_KEYBOARD_ARROW_LEFT, icon_size);
     lv_obj_align(gallery_prev_button_, LV_ALIGN_LEFT_MID, margin + 2, 0);
@@ -639,10 +648,11 @@ void HomePage::CreateUi(LvglTheme* theme) {
         CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_KEYBOARD_ARROW_RIGHT, icon_size);
     lv_obj_align(gallery_next_button_, LV_ALIGN_RIGHT_MID, -(margin + 2), 0);
     gallery_delete_button_ = CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_DELETE, icon_size);
-    lv_obj_align(gallery_delete_button_, LV_ALIGN_TOP_RIGHT, -(margin + 2), margin + 2);
+    lv_obj_align(gallery_delete_button_, LV_ALIGN_TOP_RIGHT, -(margin + 2), caption_top);
     gallery_delete_label_ = lv_obj_get_child(gallery_delete_button_, 0);
     video_play_button_ = CreateIconButton(gallery_root_, MATERIAL_SYMBOLS_PAUSE, icon_size);
-    lv_obj_align(video_play_button_, LV_ALIGN_TOP_RIGHT, -(margin + 2 + icon_size + 4), margin + 2);
+    lv_obj_align(video_play_button_, LV_ALIGN_TOP_RIGHT, -(margin + 2 + icon_size + 4),
+                 caption_top);
     video_play_label_ = lv_obj_get_child(video_play_button_, 0);
 
     // Volume +/- and a playback progress bar + timer, shown only while a video
