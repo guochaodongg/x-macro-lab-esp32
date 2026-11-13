@@ -475,6 +475,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_SEEED_XIAO_ESP32S3_RESPEAKER_XVF3800
         bool "Seeed XIAO ESP32-S3 + ReSpeaker XVF3800 USB 4-Mic Array"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_SEEED_XIAO_ESP32S3_SENSE
+        bool "Seeed XIAO ESP32-S3 Sense"
+        depends on IDF_TARGET_ESP32S3
     config BOARD_TYPE_SPOTPEAR_ESP32_S3_1_28_BOX
         bool "Spotpear ESP32-S3 1.28 Box"
         depends on IDF_TARGET_ESP32S3

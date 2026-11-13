@@ -1,0 +1,63 @@
+#ifndef _BOARD_CONFIG_H_
+#define _BOARD_CONFIG_H_
+
+#include <driver/gpio.h>
+
+/*
+ * XIAO ESP32-S3 Sense pin assignments.
+ *
+ * The Sense expansion board connects the PDM microphone, OV2640 camera and
+ * microSD socket through the B2B connector. Only GPIO1-6, GPIO43 and GPIO44
+ * remain available on the edge header; UART0 is freed by using the USB
+ * Serial/JTAG console.
+ *
+ * PDM RX is only available on I2S_NUM_0 on ESP32-S3, so playback must use
+ * I2S_NUM_1 (NoAudioCodecSimplexPdm). 32 kHz input gives a 2.048 MHz PDM
+ * clock; AudioService resamples it to the 16 kHz AFE/Opus rate.
+ */
+#define AUDIO_INPUT_SAMPLE_RATE 32000
+#define AUDIO_OUTPUT_SAMPLE_RATE 24000
+
+/* Sense expansion board: MSM261D3526H1CPM PDM microphone */
+#define AUDIO_I2S_MIC_GPIO_SCK GPIO_NUM_42
+#define AUDIO_I2S_MIC_GPIO_DIN GPIO_NUM_41
+
+/* External I2S DAC/amplifier (for example MAX98357A) on the free header */
+#define AUDIO_I2S_SPK_GPIO_BCLK GPIO_NUM_4  /* D3 */
+#define AUDIO_I2S_SPK_GPIO_LRCK GPIO_NUM_43 /* D6 / U0TXD */
+#define AUDIO_I2S_SPK_GPIO_DOUT GPIO_NUM_44 /* D7 / U0RXD */
+
+/* Buttons */
+#define BOOT_BUTTON_GPIO GPIO_NUM_0
+
+/* Sense expansion board: OV2640 DVP camera */
+#define CAMERA_PIN_PWDN GPIO_NUM_NC
+#define CAMERA_PIN_RESET GPIO_NUM_NC
+#define CAMERA_PIN_XCLK GPIO_NUM_10
+#define CAMERA_PIN_SIOD GPIO_NUM_40
+#define CAMERA_PIN_SIOC GPIO_NUM_39
+#define CAMERA_PIN_D0 GPIO_NUM_15
+#define CAMERA_PIN_D1 GPIO_NUM_17
+#define CAMERA_PIN_D2 GPIO_NUM_18
+#define CAMERA_PIN_D3 GPIO_NUM_16
+#define CAMERA_PIN_D4 GPIO_NUM_14
+#define CAMERA_PIN_D5 GPIO_NUM_12
+#define CAMERA_PIN_D6 GPIO_NUM_11
+#define CAMERA_PIN_D7 GPIO_NUM_48
+#define CAMERA_PIN_VSYNC GPIO_NUM_38
+#define CAMERA_PIN_HREF GPIO_NUM_47
+#define CAMERA_PIN_PCLK GPIO_NUM_13
+#define CAMERA_XCLK_FREQ_HZ 20000000
+
+/*
+ * Sense expansion board: microSD (SPI). GPIO21 is also the XIAO user LED,
+ * so it must not be driven as an LED while the card is in use. This board
+ * does not mount the card: the gallery/music UI needs an LCD that the Sense
+ * board does not have.
+ */
+#define SDCARD_PIN_CLK GPIO_NUM_7
+#define SDCARD_PIN_MOSI GPIO_NUM_9
+#define SDCARD_PIN_MISO GPIO_NUM_8
+#define SDCARD_PIN_CS GPIO_NUM_21
+
+#endif  // _BOARD_CONFIG_H_

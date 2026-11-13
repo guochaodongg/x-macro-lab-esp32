@@ -1,0 +1,25 @@
+{
+    "type": "xiao-esp32s3-sense",
+    "manufacturer": "seeed",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "xiao-esp32s3-sense",
+            "build_options": {
+                "camera_hmirror": false,
+                "camera_vflip": false
+            },
+            "sdkconfig_append": [
+                "CONFIG_BOARD_TYPE_SEEED_XIAO_ESP32S3_SENSE=y",
+                "CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y",
+                "CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/8m.csv\"",
+                "CONFIG_CAMERA_OV2640=y",
+                "CONFIG_CAMERA_OV2640_AUTO_DETECT_DVP_INTERFACE_SENSOR=y",
+                "CONFIG_CAMERA_OV2640_DVP_YUV422_640X480_6FPS=y",
+                "CONFIG_XIAOZHI_ENABLE_HOME_PAGE=n",
+                "CONFIG_USE_DYNAMIC_BALL_EMOJI_COLLECTION=n"
+            ]
+        }
+    ]
+}
